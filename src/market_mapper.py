@@ -119,7 +119,7 @@ def run_mapper() -> dict:
         return None
 
     print(colored("Found!", "green"))
-    print(f"  Title: {market['title']}")
+    print(f"Title: {market['title']}")
 
     # Build market map
     market_map = {
@@ -133,8 +133,8 @@ def run_mapper() -> dict:
     # Save to file
     save_market_map(market_map)
     print(colored("\nMarket map saved to market_map.json", "green"))
-    print(f"  UP token:   {market['up_token_id'][:20]}...")
-    print(f"  DOWN token: {market['down_token_id'][:20]}...")
+    print(f"UP token:   {market['up_token_id'][:20]}...{market['up_token_id'][-4:]}")
+    print(f"DOWN token: {market['down_token_id'][:20]}...{market['down_token_id'][-4:]}")
 
     return market_map
 

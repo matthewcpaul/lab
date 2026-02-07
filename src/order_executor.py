@@ -62,8 +62,9 @@ class OrderExecutor:
             self.config.up_token_id if direction == "UP" else self.config.down_token_id
         )
 
-        # Get best ask for entry
+        # Get best ask for entry and best bid for TP/SL calculation
         best_ask = self.clob_client.get_best_ask(token_id)
+        best_bid = self.clob_client.get_best_bid(token_id)
         if not best_ask:
             return OrderResult(
                 success=False,
@@ -83,11 +84,13 @@ class OrderExecutor:
 
             if filled_shares > 0:
                 # Create position with filled amount
+                # Pass entry_bid for TP/SL calculation (what we'd get if we sold now)
                 position = self.position_manager.add_position(
                     direction=direction,
                     token_id=token_id,
                     entry_price=fill_price,
                     shares=filled_shares,
+                    entry_bid=best_bid,
                 )
 
                 return OrderResult(
@@ -140,7 +143,7 @@ class OrderExecutor:
                 colored(
                     f"[{timestamp}] Bought {result.filled_shares:.2f} shares {result.direction} "
                     f"at ${result.fill_price:.2f}",
-                    "green",
+                    "cyan",
                 ),
             ]
 
@@ -148,11 +151,6 @@ class OrderExecutor:
                 lines.append(
                     f"[{timestamp}] TP: ${pos.take_profit_price:.2f} | "
                     f"SL: ${pos.stop_loss_price:.2f}"
-                )
-
-            if result.partial_fill:
-                lines.append(
-                    colored(f"[{timestamp}]   (Partial fill - rest cancelled)", "yellow")
                 )
 
             return "\n".join(lines)
@@ -177,7 +175,7 @@ class OrderExecutor:
             pnl_sign = "+" if pnl >= 0 else "-"
 
             return colored(
-                f"[{timestamp}]   P&L: {pnl_sign}${abs(pnl):.2f} ({pnl_pct:+.1f}%)",
+                f"[{timestamp}] P&L: {pnl_sign}${abs(pnl):.2f} ({pnl_pct:+.1f}%)",
                 pnl_color,
             )
         else:

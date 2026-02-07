@@ -64,12 +64,4 @@ A Python terminal application for fast manual trading on Polymarket's Bitcoin Up
 
 ## Configuration
 
-Edit `config_params.json` to adjust trading parameters:
-
-```json
-{
-  "position_size": 10.00,
-  "take_profit_pct": 0.03,
-  "stop_loss_pct": 0.03
-}
-```
+Edit `config_params.json` to adjust trading parameters.

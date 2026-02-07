@@ -79,13 +79,34 @@ class PositionManager:
         token_id: str,
         entry_price: float,
         shares: float,
+        entry_bid: float = None,
     ) -> Position:
-        """Create and track a new position."""
+        """
+        Create and track a new position.
+
+        Args:
+            direction: "UP" or "DOWN"
+            token_id: Token ID
+            entry_price: Price we paid (ASK)
+            shares: Number of shares
+            entry_bid: Current BID at entry time (what we'd get if we sold now)
+                       TP/SL are calculated from this, not entry_price, to account for spread.
+        """
         position_id = str(uuid.uuid4())[:8]
 
-        # Calculate TP/SL prices
-        tp_price = round(entry_price * (1 + self.config.take_profit_pct), 4)
-        sl_price = round(entry_price * (1 - self.config.stop_loss_pct), 4)
+        # Calculate TP/SL from the BID price (what we'd actually get when selling)
+        # This accounts for the spread so TP/SL don't trigger instantly
+        # If no bid provided, fall back to entry_price (less accurate)
+        reference_price = entry_bid if entry_bid and entry_bid > 0 else entry_price
+
+        tp_price = round(reference_price * (1 + self.config.take_profit_pct), 2)
+        sl_price = round(reference_price * (1 - self.config.stop_loss_pct), 2)
+
+        # Ensure TP > current bid and SL < current bid by at least $0.01
+        if tp_price <= reference_price:
+            tp_price = round(reference_price + 0.01, 2)
+        if sl_price >= reference_price:
+            sl_price = round(reference_price - 0.01, 2)
 
         position = Position(
             id=position_id,

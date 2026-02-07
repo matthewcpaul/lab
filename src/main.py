@@ -138,12 +138,12 @@ class TradingBot:
         )
         for pos in self.position_manager.list_open_positions():
             if pos.token_id == token_id:
-                print(colored(f"[{timestamp}]   Skipped: position already open", "yellow"))
+                print(colored(f"[{timestamp}] Skipped: position already open", "yellow"))
                 return
 
         # Check spread
         if not self.signal_controller._check_spread(token_id):
-            print(colored(f"[{timestamp}]   Skipped: spread too wide", "yellow"))
+            print(colored(f"[{timestamp}] Skipped: spread too wide", "yellow"))
             return
 
         # Execute entry and show result

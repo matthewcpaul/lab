@@ -358,28 +358,31 @@ class FastClobClient:
             filled = 0.0
             fill_price = submitted_price
 
-            # DEBUG: Print raw response to see what fields are available
-            print(f"  [DEBUG] Raw order response keys: {list(result.keys())}")
-            if "trades" in result:
-                print(f"  [DEBUG] trades found: {result['trades']}")
+            # Check for takingAmount/makingAmount in response (Polymarket FAK fill data)
+            # For BUY: takingAmount = shares received, makingAmount = USDC spent
+            # For SELL: takingAmount = USDC received, makingAmount = shares sold
+            taking = result.get("takingAmount")
+            making = result.get("makingAmount")
 
-            # First, check for trades in the immediate response
-            # FAK orders return fills directly in the response
-            trades = result.get("trades", [])
-            if trades:
-                total_filled = 0.0
-                total_value = 0.0
-                for trade in trades:
-                    trade_size = float(trade.get("size", 0))
-                    trade_price = float(trade.get("price", 0))
-                    if trade_size > 0 and trade_price > 0:
-                        total_filled += trade_size
-                        total_value += trade_size * trade_price
-                if total_filled > 0:
-                    filled = total_filled
-                    fill_price = total_value / total_filled
+            if taking and making:
+                try:
+                    taking_val = float(taking)
+                    making_val = float(making)
+                    if taking_val > 0 and making_val > 0:
+                        if side == "BUY":
+                            # BUY: taking=shares, making=USDC
+                            filled = taking_val
+                            fill_price = making_val / taking_val
+                        else:
+                            # SELL: taking=USDC, making=shares
+                            filled = making_val
+                            fill_price = taking_val / making_val
+                        # Round price to 2 decimals
+                        fill_price = round(fill_price, 2)
+                except (ValueError, TypeError, ZeroDivisionError):
+                    pass
 
-            # If no trades in response but order was successful, query for fill data
+            # If no fill data from takingAmount/makingAmount, query for fill data
             if filled == 0 and success and order_id:
                 # Retry loop: trade data may take a moment to appear
                 for attempt in range(3):

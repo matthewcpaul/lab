@@ -1,0 +1,6 @@
+.env
+market_map.json
+__pycache__/
+*.pyc
+.venv/
+venv/

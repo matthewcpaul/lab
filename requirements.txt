@@ -1,0 +1,6 @@
+py-clob-client==0.17.5
+websockets>=11.0
+python-dotenv>=1.0.0
+termcolor>=2.0.0
+pynput>=1.7.0
+requests>=2.31.0

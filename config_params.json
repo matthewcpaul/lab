@@ -1,9 +1,11 @@
 {
   "position_size": 2.00,
-  "trigger_threshold": 0.0003,
+  "take_profit_pct": 0.02,
+  "stop_loss_pct": 0.03,
   "max_spread_pct": 0.02,
-  "take_profit_pct": 0.04,
-  "stop_loss_pct": 0.05,
+  "trigger_threshold": 0.0001,
   "volatility_window_ms": 500,
-  "signal_cooldown_ms": 2000
+  "signal_cooldown_ms": 2000,
+  "stale_position_sec": 5.0,
+  "price_cache_stale_ms": 5000
 }

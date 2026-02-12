@@ -2,13 +2,16 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from termcolor import colored
 
 from .clob_client import FastClobClient
 from .config import Config
 from .position_manager import Position, PositionManager
+
+if TYPE_CHECKING:
+    from .price_cache import PriceCache
 
 
 @dataclass
@@ -38,10 +41,12 @@ class OrderExecutor:
         clob_client: FastClobClient,
         config: Config,
         position_manager: PositionManager,
+        price_cache: Optional["PriceCache"] = None,
     ):
         self.clob_client = clob_client
         self.config = config
         self.position_manager = position_manager
+        self.price_cache = price_cache
 
     def execute_entry(self, direction: str, dollar_amount: Optional[float] = None) -> OrderResult:
         """
@@ -63,8 +68,14 @@ class OrderExecutor:
         )
 
         # Get best ask for entry and best bid for TP/SL calculation
-        best_ask = self.clob_client.get_best_ask(token_id)
-        best_bid = self.clob_client.get_best_bid(token_id)
+        # Use price cache for low-latency reads, fallback to REST
+        if self.price_cache is not None:
+            best_ask = self.price_cache.get_best_ask(token_id)
+            best_bid = self.price_cache.get_best_bid(token_id)
+        else:
+            best_ask = self.clob_client.get_best_ask(token_id)
+            best_bid = self.clob_client.get_best_bid(token_id)
+
         if not best_ask:
             return OrderResult(
                 success=False,
@@ -75,8 +86,8 @@ class OrderExecutor:
                 error_msg="No asks available in orderbook",
             )
 
-        # Place market buy order
-        result = self.clob_client.place_market_buy(token_id, dollar_amount)
+        # Place market buy order (pass cached price to avoid REST call)
+        result = self.clob_client.place_market_buy(token_id, dollar_amount, price=best_ask)
 
         if result.get("success"):
             filled_shares = result.get("filled", 0.0)
@@ -155,8 +166,15 @@ class OrderExecutor:
 
             return "\n".join(lines)
         else:
+            # Make FAK "no liquidity" errors concise and yellow (like spread warnings)
+            error_msg = result.error_msg or "Unknown error"
+            if "no orders found to match with FAK" in error_msg:
+                return colored(
+                    f"[{timestamp}] Skipped: no liquidity at price",
+                    "yellow",
+                )
             return colored(
-                f"[{timestamp}] Order failed: {result.error_msg}",
+                f"[{timestamp}] Order failed: {error_msg}",
                 "red",
             )
 

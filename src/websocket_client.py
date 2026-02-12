@@ -2,10 +2,13 @@
 
 import asyncio
 import json
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import websockets
 from websockets.exceptions import ConnectionClosed
+
+if TYPE_CHECKING:
+    from .price_cache import PriceCache
 
 
 class PriceStream:
@@ -19,6 +22,7 @@ class PriceStream:
         on_price_update: Callable[[str, float, float], None],
         on_connect: Optional[Callable[[], None]] = None,
         on_disconnect: Optional[Callable[[], None]] = None,
+        price_cache: Optional["PriceCache"] = None,
     ):
         """
         Initialize price stream.
@@ -28,13 +32,15 @@ class PriceStream:
             on_price_update: Callback(token_id, best_bid, best_ask) on each update
             on_connect: Optional callback when connected
             on_disconnect: Optional callback when disconnected
+            price_cache: Optional shared PriceCache to update on every price message
         """
         self.token_ids = token_ids
         self.on_price_update = on_price_update
         self.on_connect = on_connect
         self.on_disconnect = on_disconnect
+        self.price_cache = price_cache
 
-        # Current prices cache
+        # Current prices cache (internal, for backward compatibility)
         self.prices: dict[str, dict] = {}
         for token_id in token_ids:
             self.prices[token_id] = {"bid": None, "ask": None}
@@ -215,6 +221,11 @@ class PriceStream:
 
         if updated:
             current = self.prices[asset_id]
+
+            # Update shared price cache if available (for low-latency reads)
+            if self.price_cache is not None:
+                self.price_cache.update(asset_id, current["bid"], current["ask"])
+
             self.on_price_update(
                 asset_id,
                 current["bid"],

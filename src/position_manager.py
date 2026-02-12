@@ -23,6 +23,7 @@ class PositionStatus(Enum):
 class ExitReason(Enum):
     TAKE_PROFIT = "TAKE_PROFIT"
     STOP_LOSS = "STOP_LOSS"
+    STALE_BREAKEVEN = "STALE_BREAKEVEN"
     MANUAL = "MANUAL"
 
 
@@ -42,6 +43,11 @@ class Position:
     exit_price: Optional[float] = None
     exit_time: Optional[datetime] = None
     exit_reason: Optional[ExitReason] = None
+
+    # Stale position tracking for trailing stop
+    peak_price_since_entry: Optional[float] = None  # Highest price seen
+    is_stale: bool = False  # True after stale_position_sec without TP
+    stale_since_ms: Optional[float] = None  # When position became stale
 
     @property
     def cost_basis(self) -> float:
@@ -134,9 +140,17 @@ class PositionManager:
         """
         Check if any position should exit.
         Called on every price update (silently).
+
+        Exit conditions checked:
+        1. Take profit: current_bid >= take_profit_price
+        2. Stop loss: current_bid <= stop_loss_price
+        3. Stale breakeven: position is stale AND current_bid >= entry_price
+           (If stale but underwater, wait for recovery to breakeven or stop loss)
         """
         if current_bid is None:
             return
+
+        now_ms = time.time() * 1000
 
         for pos in list(self.positions.values()):
             if pos.token_id != token_id or pos.status != PositionStatus.OPEN:
@@ -147,10 +161,28 @@ class PositionManager:
                 asyncio.create_task(
                     self._async_trigger_exit(pos, ExitReason.TAKE_PROFIT, current_bid)
                 )
+                continue
+
             # Check stop loss
-            elif current_bid <= pos.stop_loss_price:
+            if current_bid <= pos.stop_loss_price:
                 asyncio.create_task(
                     self._async_trigger_exit(pos, ExitReason.STOP_LOSS, current_bid)
+                )
+                continue
+
+            # Check if position became stale (no TP within stale_position_sec)
+            entry_time_ms = pos.entry_time.timestamp() * 1000
+            position_age_sec = (now_ms - entry_time_ms) / 1000.0
+
+            if not pos.is_stale and position_age_sec >= self.config.stale_position_sec:
+                pos.is_stale = True
+                pos.stale_since_ms = now_ms
+
+            # Stale breakeven exit: if stale AND can exit at breakeven or better
+            # If underwater, wait for price to recover or hit stop loss
+            if pos.is_stale and current_bid >= pos.entry_price:
+                asyncio.create_task(
+                    self._async_trigger_exit(pos, ExitReason.STALE_BREAKEVEN, current_bid)
                 )
 
     async def _async_trigger_exit(
@@ -190,7 +222,7 @@ class PositionManager:
 
         # Log trigger and sell intent
         timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        reason_colors = {"TAKE_PROFIT": "green", "STOP_LOSS": "red", "MANUAL": "yellow"}
+        reason_colors = {"TAKE_PROFIT": "green", "STOP_LOSS": "red", "STALE_BREAKEVEN": "cyan", "MANUAL": "yellow"}
         print(colored(
             f"[{timestamp}] {reason.value} triggered",
             reason_colors.get(reason.value, "white"),

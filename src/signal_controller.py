@@ -1,11 +1,14 @@
 """Signal controller for auto-trade execution based on Coinbase volatility signals."""
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from .clob_client import FastClobClient
 from .config import Config
 from .order_executor import OrderExecutor
 from .position_manager import PositionManager
+
+if TYPE_CHECKING:
+    from .price_cache import PriceCache
 
 
 class SignalController:
@@ -17,20 +20,23 @@ class SignalController:
         config: Config,
         order_executor: OrderExecutor,
         position_manager: PositionManager,
+        price_cache: Optional["PriceCache"] = None,
     ):
         """
         Initialize signal controller.
 
         Args:
-            clob_client: CLOB client for spread checks
+            clob_client: CLOB client for spread checks (fallback)
             config: Configuration object
             order_executor: Order executor for entries
             position_manager: Position manager for position checks
+            price_cache: Optional shared PriceCache for low-latency spread checks
         """
         self.clob_client = clob_client
         self.config = config
         self.order_executor = order_executor
         self.position_manager = position_manager
+        self.price_cache = price_cache
 
         self._auto_enabled = True
 
@@ -69,12 +75,20 @@ class SignalController:
         """
         Check if spread is within acceptable range.
 
+        Uses PriceCache for low-latency checks (no REST call).
+        Falls back to CLOB client REST API if cache is unavailable or stale.
+
         Args:
             token_id: Token to check
 
         Returns:
             True if spread is acceptable
         """
+        # Try price cache first (no REST call, ~0ms latency)
+        if self.price_cache is not None:
+            return self.price_cache.is_spread_acceptable(token_id, self.config.max_spread_pct)
+
+        # Fallback to REST API (100-200ms latency)
         best_bid = self.clob_client.get_best_bid(token_id)
         best_ask = self.clob_client.get_best_ask(token_id)
 

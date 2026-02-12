@@ -112,18 +112,22 @@ class FastClobClient:
 
         return 0.0, float(Decimal(str(price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
 
-    def place_market_buy(self, token_id: str, dollar_amount: float) -> dict:
+    def place_market_buy(
+        self, token_id: str, dollar_amount: float, price: Optional[float] = None
+    ) -> dict:
         """
         Place a market buy order (FAK at best ask).
 
         Args:
             token_id: The token to buy
             dollar_amount: Amount in dollars to spend
+            price: Optional price to use (skips REST call if provided)
 
         Returns:
             Order result dict with 'success', 'orderID', etc.
         """
-        best_ask = self.get_best_ask(token_id)
+        # Use provided price or fetch from REST API
+        best_ask = price if price is not None else self.get_best_ask(token_id)
         if not best_ask:
             return {"success": False, "errorMsg": "No asks available"}
 

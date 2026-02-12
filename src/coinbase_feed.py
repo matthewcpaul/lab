@@ -3,10 +3,13 @@
 import asyncio
 import json
 from collections import deque
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional, Union
 
 import websockets
 from websockets.exceptions import ConnectionClosed
+
+# Signal callback type: can be sync or async
+SignalCallback = Union[Callable[[str], None], Callable[[str], Awaitable[None]]]
 
 
 class RollingWindow:
@@ -74,7 +77,7 @@ class CoinbaseFeed:
         window_ms: int,
         threshold: float,
         cooldown_ms: int,
-        on_signal: Callable[[str], None],
+        on_signal: SignalCallback,
         on_connect: Optional[Callable[[], None]] = None,
         on_disconnect: Optional[Callable[[], None]] = None,
     ):
@@ -85,7 +88,8 @@ class CoinbaseFeed:
             window_ms: Rolling window size in milliseconds
             threshold: Trigger threshold as decimal (e.g., 0.00015 = 0.015%)
             cooldown_ms: Minimum milliseconds between signals
-            on_signal: Callback(direction) when signal fires ("UP" or "DOWN")
+            on_signal: Callback(direction) when signal fires ("UP" or "DOWN").
+                       Can be sync or async function.
             on_connect: Optional callback when connected
             on_disconnect: Optional callback when disconnected
         """
@@ -101,9 +105,16 @@ class CoinbaseFeed:
         self._paused = False
         self._ws = None
 
+        # Async queue for non-blocking signal processing
+        self._signal_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._signal_processor_task: Optional[asyncio.Task] = None
+
     async def connect(self):
         """Connect to Coinbase WebSocket and start processing matches."""
         self._running = True
+
+        # Start signal processor task (runs in background, consumes queue)
+        self._signal_processor_task = asyncio.create_task(self._process_signals())
 
         while self._running:
             try:
@@ -144,6 +155,14 @@ class CoinbaseFeed:
                     await asyncio.sleep(1)
 
         self._ws = None
+
+        # Cancel signal processor task
+        if self._signal_processor_task:
+            self._signal_processor_task.cancel()
+            try:
+                await self._signal_processor_task
+            except asyncio.CancelledError:
+                pass
 
     def stop(self):
         """Stop the feed."""
@@ -222,7 +241,7 @@ class CoinbaseFeed:
             return None
 
     def _check_signal(self, current_time_ms: float):
-        """Check if volatility threshold crossed and fire signal."""
+        """Check if volatility threshold crossed and queue signal (non-blocking)."""
         if self._paused:
             return
 
@@ -238,7 +257,33 @@ class CoinbaseFeed:
         if current_time_ms - self._last_signal_time < self.cooldown_ms:
             return
 
-        # Fire signal
+        # Queue signal (non-blocking - doesn't wait for processing)
         direction = "UP" if pct_change > 0 else "DOWN"
         self._last_signal_time = current_time_ms
-        self.on_signal(direction)
+
+        # put_nowait is non-blocking - if queue is full, raises QueueFull
+        # We use an unbounded queue so this won't happen in practice
+        try:
+            self._signal_queue.put_nowait(direction)
+        except asyncio.QueueFull:
+            pass  # Drop signal if queue somehow fills up
+
+    async def _process_signals(self):
+        """Background task that consumes signal queue and calls callback."""
+        while self._running:
+            try:
+                # Wait for next signal (blocks until available)
+                direction = await self._signal_queue.get()
+
+                # Call the signal callback (supports both sync and async)
+                result = self.on_signal(direction)
+                if asyncio.iscoroutine(result):
+                    await result
+
+                self._signal_queue.task_done()
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                # Don't let callback errors kill the processor
+                pass

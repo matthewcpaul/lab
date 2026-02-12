@@ -155,6 +155,16 @@ class Config:
         return self.params.get("max_spread_pct", 0.02)
 
     @property
+    def stale_position_sec(self) -> float:
+        """Seconds after which a position is considered stale (activates trailing stop)."""
+        return self.params.get("stale_position_sec", 5.0)
+
+    @property
+    def price_cache_stale_ms(self) -> int:
+        """Milliseconds after which cached prices are considered stale."""
+        return self.params.get("price_cache_stale_ms", 5000)
+
+    @property
     def up_token_id(self) -> str:
         if not self.market:
             raise ValueError("Market not loaded. Call load_market() first.")

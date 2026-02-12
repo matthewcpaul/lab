@@ -2,11 +2,12 @@
 
 import asyncio
 import sys
+import termios
 import threading
+import tty
 from datetime import datetime, timezone
 from typing import Optional
 
-from pynput import keyboard
 from termcolor import colored
 
 from .clob_client import FastClobClient
@@ -14,7 +15,6 @@ from .coinbase_feed import CoinbaseFeed
 from .config import Config
 from .order_executor import OrderExecutor
 from .position_manager import ExitReason, Position, PositionManager
-from .price_cache import PriceCache
 from .signal_controller import SignalController
 from .websocket_client import PriceStream
 
@@ -30,15 +30,11 @@ class TradingBot:
         self.price_stream: Optional[PriceStream] = None
         self.coinbase_feed: Optional[CoinbaseFeed] = None
         self.signal_controller: Optional[SignalController] = None
-        self.price_cache: Optional[PriceCache] = None
 
         self._running = False
         self._in_exit_menu = False
         self._exit_menu_positions: list[Position] = []
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-
-        # O(1) lookup for open position token IDs (prevents duplicate entries)
-        self._open_position_tokens: set[str] = set()
 
     def initialize(self):
         """Initialize all components."""
@@ -64,9 +60,6 @@ class TradingBot:
             print(colored(f"CLOB client error: {e}", "red"))
             sys.exit(1)
 
-        # Initialize shared price cache (WebSocket updates, signal handler reads)
-        self.price_cache = PriceCache(stale_ms=self.config.price_cache_stale_ms)
-
         # Initialize position manager with exit callback
         self.position_manager = PositionManager(
             self.clob_client,
@@ -74,31 +67,28 @@ class TradingBot:
             on_exit_complete=self._on_exit_complete,
         )
 
-        # Initialize order executor with price cache for low-latency reads
+        # Initialize order executor
         self.order_executor = OrderExecutor(
             self.clob_client,
             self.config,
             self.position_manager,
-            price_cache=self.price_cache,
         )
 
-        # Initialize price stream with shared price cache
+        # Initialize price stream
         token_ids = [self.config.up_token_id, self.config.down_token_id]
         self.price_stream = PriceStream(
             token_ids,
             on_price_update=self._on_price_update,
             on_connect=self._on_ws_connect,
             on_disconnect=self._on_ws_disconnect,
-            price_cache=self.price_cache,
         )
 
-        # Initialize signal controller with price cache for low-latency spread checks
+        # Initialize signal controller
         self.signal_controller = SignalController(
             self.clob_client,
             self.config,
             self.order_executor,
             self.position_manager,
-            price_cache=self.price_cache,
         )
 
         # Initialize Coinbase feed for BTC volatility detection
@@ -133,8 +123,8 @@ class TradingBot:
         timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
         print(colored(f"[{timestamp}] WebSocket disconnected, reconnecting...", "yellow"))
 
-    async def _on_coinbase_signal(self, direction: str):
-        """Handle volatility signal from Coinbase feed (async, non-blocking)."""
+    def _on_coinbase_signal(self, direction: str):
+        """Handle volatility signal from Coinbase feed."""
         timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
         print(colored(f"[{timestamp}] AUTO-SIGNAL: {direction}", "magenta"))
 
@@ -142,31 +132,25 @@ class TradingBot:
         if not self.signal_controller.is_enabled:
             return
 
-        # Check position limit using O(1) set lookup
+        # Check position limit
         token_id = (
             self.config.up_token_id if direction == "UP"
             else self.config.down_token_id
         )
-        if token_id in self._open_position_tokens:
-            print(colored(f"[{timestamp}] Skipped: position already open", "yellow"))
-            return
+        for pos in self.position_manager.list_open_positions():
+            if pos.token_id == token_id:
+                print(colored(f"[{timestamp}]   Skipped: position already open", "yellow"))
+                return
 
-        # Check spread using price cache (no REST call)
+        # Check spread
         if not self.signal_controller._check_spread(token_id):
-            print(colored(f"[{timestamp}] Skipped: spread too wide", "yellow"))
+            print(colored(f"[{timestamp}]   Skipped: spread too wide", "yellow"))
             return
-
-        # Mark token as having open position BEFORE order (prevents race conditions)
-        self._open_position_tokens.add(token_id)
 
         # Execute entry and show result
         result = self.order_executor.execute_entry(direction)
         output = self.order_executor.format_entry_result(result)
         print(output)
-
-        # If order failed, remove from open positions set
-        if not result.success:
-            self._open_position_tokens.discard(token_id)
 
     def _on_coinbase_connect(self):
         """Handle Coinbase WebSocket connection."""
@@ -193,17 +177,12 @@ class TradingBot:
 
     def _on_exit_complete(self, position: Position, reason: ExitReason):
         """Handle position exit completion."""
-        # Remove token from open positions set (allows new entries)
-        self._open_position_tokens.discard(position.token_id)
-
         output = self.order_executor.format_exit_result(position, reason.value)
         print(output)
 
-    def _on_key_press(self, key):
+    def _on_key_press(self, char: str):
         """Handle keyboard input."""
-        try:
-            char = key.char
-        except AttributeError:
+        if not char:
             return
 
         if self._in_exit_menu:
@@ -331,14 +310,27 @@ class TradingBot:
         if self.coinbase_feed:
             self.coinbase_feed.stop()
 
+    def _stdin_reader(self):
+        """Read single keystrokes from stdin in raw mode (runs in thread)."""
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while self._running:
+                ch = sys.stdin.read(1)
+                if ch:
+                    self._on_key_press(ch)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
     async def run_async(self):
         """Run the bot asynchronously."""
         self._running = True
         self._loop = asyncio.get_event_loop()
 
-        # Start keyboard listener in separate thread
-        listener = keyboard.Listener(on_press=self._on_key_press)
-        listener.start()
+        # Start keyboard reader in separate thread
+        reader_thread = threading.Thread(target=self._stdin_reader, daemon=True)
+        reader_thread.start()
 
         timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
         print(colored(
@@ -355,8 +347,6 @@ class TradingBot:
             )
         except asyncio.CancelledError:
             pass
-        finally:
-            listener.stop()
 
     def run(self):
         """Run the bot (blocking)."""

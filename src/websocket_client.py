@@ -170,7 +170,7 @@ class PriceStream:
             # One-time debug log to verify sort order
             if not self._book_debug_logged and len(bids) > 1:
                 sort_dir = "ascending" if first_bid < last_bid else "descending"
-                print(f"  [DEBUG] WS bids: {sort_dir} (first={first_bid}, last={last_bid}, best={best_bid})")
+                print(f"   [DEBUG] WS bids: {sort_dir} (first={first_bid}, last={last_bid}, best={best_bid})")
 
         if asks:
             first_ask = float(asks[0].get("price", 0))
@@ -180,7 +180,7 @@ class PriceStream:
 
             if not self._book_debug_logged and len(asks) > 1:
                 sort_dir = "ascending" if first_ask < last_ask else "descending"
-                print(f"  [DEBUG] WS asks: {sort_dir} (first={first_ask}, last={last_ask}, best={best_ask})")
+                print(f"   [DEBUG] WS asks: {sort_dir} (first={first_ask}, last={last_ask}, best={best_ask})")
 
         if bids and asks and not self._book_debug_logged:
             self._book_debug_logged = True

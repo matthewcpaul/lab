@@ -76,11 +76,11 @@ class OrderExecutor:
             best_bid = self.price_cache.get_best_bid(token_id)
             age = self.price_cache.get_age_ms(token_id)
             age_str = f"{age:.0f}ms" if age is not None else "N/A"
-            print(f"  [DEBUG] Prices from cache (age: {age_str})")
+            print(f"   [DEBUG] Prices from cache (age: {age_str})")
         else:
             best_ask = self.clob_client.get_best_ask(token_id)
             best_bid = self.clob_client.get_best_bid(token_id)
-            print("  [DEBUG] Prices from REST (no cache)")
+            print("   [DEBUG] Prices from REST (no cache)")
 
         if not best_ask:
             order_result = OrderResult(

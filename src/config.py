@@ -151,8 +151,8 @@ class Config:
         return self.params.get("volatility_window_ms", 500)
 
     @property
-    def max_spread_pct(self) -> float:
-        return self.params.get("max_spread_pct", 0.02)
+    def max_spread_cents(self) -> int:
+        return self.params.get("max_spread_cents", 1)
 
     @property
     def stale_position_sec(self) -> float:

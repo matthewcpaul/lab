@@ -116,7 +116,7 @@ class TradingBot:
         print(f"  Trigger threshold: {self.config.trigger_threshold * 100:.3f}%")
         print(f"  Signal cooldown: {self.config.signal_cooldown_ms}ms")
         print(f"  Volatility window: {self.config.volatility_window_ms}ms")
-        print(f"  Max spread: {self.config.max_spread_pct * 100:.1f}%")
+        print(f"  Max spread: {self.config.max_spread_cents}c")
 
         # Log session start for data capture
         self.data_logger.log({
@@ -128,7 +128,7 @@ class TradingBot:
                 "trigger_threshold": self.config.trigger_threshold,
                 "signal_cooldown_ms": self.config.signal_cooldown_ms,
                 "volatility_window_ms": self.config.volatility_window_ms,
-                "max_spread_pct": self.config.max_spread_pct,
+                "max_spread_cents": self.config.max_spread_cents,
                 "stale_position_sec": self.config.stale_position_sec,
                 "price_cache_stale_ms": self.config.price_cache_stale_ms,
             },
@@ -148,12 +148,12 @@ class TradingBot:
         snapshot = self.price_cache.get(token_id)
         if not snapshot or snapshot.best_bid is None or snapshot.best_ask is None:
             return None
-        spread_pct = (snapshot.best_ask - snapshot.best_bid) / snapshot.best_bid if snapshot.best_bid > 0 else None
+        spread_cents = round((snapshot.best_ask - snapshot.best_bid) * 100) if snapshot.best_bid > 0 else None
         return {
             "token_id": token_id,
             "best_bid": snapshot.best_bid,
             "best_ask": snapshot.best_ask,
-            "spread_pct": spread_pct,
+            "spread_cents": spread_cents,
         }
 
     def _on_price_update(self, token_id: str, best_bid: float, best_ask: float):

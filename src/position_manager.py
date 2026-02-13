@@ -295,7 +295,7 @@ class PositionManager:
             "token_id": token_id,
             "best_bid": best_bid,
             "best_ask": best_ask,
-            "spread_pct": (best_ask - best_bid) / best_bid,
+            "spread_cents": round((best_ask - best_bid) * 100),
         }
 
     def _log_exit(

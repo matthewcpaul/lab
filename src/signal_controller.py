@@ -63,7 +63,7 @@ class SignalController:
             if pos.token_id == token_id:
                 return False
 
-        # Check 3: Spread within max_spread_pct
+        # Check 3: Spread within max_spread_cents
         if not self._check_spread(token_id):
             return False
 
@@ -86,7 +86,7 @@ class SignalController:
         """
         # Try price cache first (no REST call, ~0ms latency)
         if self.price_cache is not None:
-            return self.price_cache.is_spread_acceptable(token_id, self.config.max_spread_pct)
+            return self.price_cache.is_spread_acceptable(token_id, self.config.max_spread_cents)
 
         # Fallback to REST API (100-200ms latency)
         best_bid = self.clob_client.get_best_bid(token_id)
@@ -98,8 +98,8 @@ class SignalController:
         if best_bid <= 0:
             return False
 
-        spread_pct = (best_ask - best_bid) / best_bid
-        return spread_pct <= self.config.max_spread_pct
+        spread = best_ask - best_bid
+        return spread <= self.config.max_spread_cents * 0.01
 
     def enable_auto(self):
         """Enable automatic signal handling."""

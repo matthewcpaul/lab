@@ -107,13 +107,13 @@ class PriceCache:
             return None
         return snapshot.best_ask
 
-    def is_spread_acceptable(self, token_id: str, max_spread_pct: float) -> bool:
+    def is_spread_acceptable(self, token_id: str, max_spread_cents: int) -> bool:
         """
         Check if the spread for a token is within acceptable range.
 
         Args:
             token_id: Token to check
-            max_spread_pct: Maximum acceptable spread as decimal (e.g., 0.02 = 2%)
+            max_spread_cents: Maximum acceptable spread in cents (e.g., 1 = 1 cent)
 
         Returns:
             True if spread is acceptable and prices are fresh, False otherwise
@@ -128,8 +128,8 @@ class PriceCache:
         if snapshot.best_bid <= 0:
             return False
 
-        spread_pct = (snapshot.best_ask - snapshot.best_bid) / snapshot.best_bid
-        return spread_pct <= max_spread_pct
+        spread = snapshot.best_ask - snapshot.best_bid
+        return spread <= max_spread_cents * 0.01
 
     def is_stale(self, token_id: str) -> bool:
         """

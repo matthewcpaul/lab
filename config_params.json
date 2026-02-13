@@ -2,7 +2,7 @@
   "position_size": 2.00,
   "take_profit_pct": 0.03,
   "stop_loss_pct": 0.03,
-  "max_spread_pct": 0.02,
+  "max_spread_cents": 2,
   "trigger_threshold": 0.00015,
   "volatility_window_ms": 500,
   "signal_cooldown_ms": 2000,

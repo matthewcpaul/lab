@@ -6,12 +6,15 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from termcolor import colored
 
 from .clob_client import FastClobClient
 from .config import Config
+
+if TYPE_CHECKING:
+    from .price_cache import PriceCache
 
 
 class PositionStatus(Enum):
@@ -72,11 +75,13 @@ class PositionManager:
         config: Config,
         on_exit_complete: Optional[Callable[[Position, ExitReason], None]] = None,
         data_logger: Optional[object] = None,
+        price_cache: Optional["PriceCache"] = None,
     ):
         self.clob_client = clob_client
         self.config = config
         self.on_exit_complete = on_exit_complete
         self.data_logger = data_logger
+        self.price_cache = price_cache
 
         self.positions: dict[str, Position] = {}
         self._exit_lock = asyncio.Lock()
@@ -246,7 +251,7 @@ class PositionManager:
 
         # --- Phase 2 or Dust cleanup ---
         if remaining > 0.01:
-            best_bid = self.clob_client.get_best_bid(position.token_id) or 0
+            best_bid = self._get_cached_best_bid(position.token_id) or 0
             remaining_value = remaining * best_bid
 
             if remaining_value >= self.DUST_THRESHOLD_DOLLARS:
@@ -271,7 +276,7 @@ class PositionManager:
             position.shares = total_filled
         else:
             # No fills at all - use current best bid for P&L calculation
-            position.exit_price = self.clob_client.get_best_bid(position.token_id) or 0
+            position.exit_price = self._get_cached_best_bid(position.token_id) or 0
 
         position.status = PositionStatus.CLOSED
         position.exit_time = datetime.now(timezone.utc)
@@ -285,8 +290,35 @@ class PositionManager:
         if self.on_exit_complete:
             self.on_exit_complete(position, reason)
 
+    def _get_cached_best_bid(self, token_id: str) -> Optional[float]:
+        """Get best bid from cache, falling back to REST if cache is stale."""
+        if self.price_cache is not None:
+            bid = self.price_cache.get_best_bid(token_id)
+            if bid is not None:
+                return bid
+        return self.clob_client.get_best_bid(token_id)
+
     def _get_spread_snapshot(self, token_id: str) -> Optional[dict]:
-        """Get Polymarket bid/ask/spread for logging."""
+        """Get Polymarket bid/ask/spread for logging.
+
+        Uses PriceCache when available (no REST calls, ~0ms).
+        Falls back to REST API only if cache is unavailable.
+        """
+        if self.price_cache is not None:
+            snapshot = self.price_cache.get(token_id)
+            if snapshot is not None:
+                best_bid = snapshot.best_bid
+                best_ask = snapshot.best_ask
+                if best_bid is None or best_ask is None or best_bid <= 0:
+                    return None
+                return {
+                    "token_id": token_id,
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "spread_cents": round((best_ask - best_bid) * 100),
+                }
+
+        # Fallback to REST (2 separate order book fetches)
         best_bid = self.clob_client.get_best_bid(token_id)
         best_ask = self.clob_client.get_best_ask(token_id)
         if best_bid is None or best_ask is None or best_bid <= 0:
@@ -394,8 +426,8 @@ class PositionManager:
         while remaining > 0.01 and attempt < max_attempts and consecutive_failures < max_consecutive_failures:
             attempt += 1
 
-            # Get fresh best bid each attempt
-            best_bid = self.clob_client.get_best_bid(token_id)
+            # Get best bid: use cache for speed, fall back to REST if stale
+            best_bid = self._get_cached_best_bid(token_id)
 
             if best_bid is None or best_bid <= 0:
                 consecutive_failures += 1
@@ -464,6 +496,30 @@ class PositionManager:
             if pos.status == PositionStatus.CLOSED and pos.exit_price:
                 total += (pos.exit_price - pos.entry_price) * pos.shares
         return total
+
+    def get_trade_stats(self) -> dict:
+        """Calculate trade statistics from closed positions."""
+        wins = 0
+        losses = 0
+        breakevens = 0
+        for pos in self.positions.values():
+            if pos.status == PositionStatus.CLOSED and pos.exit_price is not None:
+                pnl = round((pos.exit_price - pos.entry_price) * pos.shares, 2)
+                if pnl > 0:
+                    wins += 1
+                elif pnl < 0:
+                    losses += 1
+                else:
+                    breakevens += 1
+        total = wins + losses + breakevens
+        win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0.0
+        return {
+            "total": total,
+            "wins": wins,
+            "losses": losses,
+            "breakevens": breakevens,
+            "win_rate": win_rate,
+        }
 
     def get_position_summary(self, position: Position, current_bid: Optional[float] = None) -> str:
         """Get formatted summary string for a position."""

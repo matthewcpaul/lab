@@ -4,9 +4,11 @@ import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Optional
 
+import httpx
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
 from py_clob_client.constants import POLYGON
+from py_clob_client.http_helpers import helpers as _clob_http_helpers
 
 from .config import Config
 
@@ -31,6 +33,32 @@ class FastClobClient:
 
         # Derive API credentials from private key (ensures they match)
         self.client.set_api_creds(self.client.derive_api_key())
+
+        # Replace the library's default httpx.Client with optimized settings.
+        # Default keepalive_expiry is only 5s; after idle periods the connection
+        # drops and each request pays ~300-400ms for TCP+TLS+HTTP/2 setup.
+        # Setting keepalive_expiry=600 (10 min) keeps the connection warm.
+        _clob_http_helpers._http_client = httpx.Client(
+            http2=True,
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            limits=httpx.Limits(
+                max_keepalive_connections=5,
+                max_connections=10,
+                keepalive_expiry=600,
+            ),
+        )
+
+    def warm_up(self):
+        """Pre-establish the HTTP/2 connection to Polymarket.
+
+        Makes a lightweight GET /time call so the TCP+TLS+HTTP/2 handshake
+        happens before the first real trade, avoiding ~300-400ms extra latency
+        on the very first order.
+        """
+        try:
+            self.client.get_server_time()
+        except Exception:
+            pass  # Non-critical; connection will be established on first real call
 
     def get_order_book(self, token_id: str) -> dict:
         """Get full order book for a token."""

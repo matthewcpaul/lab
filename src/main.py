@@ -60,9 +60,13 @@ class TradingBot:
         # Initialize CLOB client
         try:
             self.clob_client = FastClobClient(self.config)
+            self.clob_client.warm_up()  # Pre-establish HTTP/2 connection
         except Exception as e:
             print(colored(f"CLOB client error: {e}", "red"))
             sys.exit(1)
+
+        # Initialize price cache (WebSocket keeps it fresh; used by executor, signal controller, and position manager)
+        self.price_cache = PriceCache(stale_ms=self.config.price_cache_stale_ms)
 
         # Initialize position manager with exit callback
         self.position_manager = PositionManager(
@@ -70,10 +74,8 @@ class TradingBot:
             self.config,
             on_exit_complete=self._on_exit_complete,
             data_logger=self.data_logger,
+            price_cache=self.price_cache,
         )
-
-        # Initialize price cache (WebSocket keeps it fresh; used by executor and signal controller)
-        self.price_cache = PriceCache(stale_ms=self.config.price_cache_stale_ms)
 
         # Initialize order executor
         self.order_executor = OrderExecutor(
@@ -362,6 +364,13 @@ class TradingBot:
         if realized != 0:
             pnl_color = "green" if realized >= 0 else "red"
             print(colored(f"  Realized P&L: ${realized:+.2f}", pnl_color))
+
+        # Trade stats
+        stats = self.position_manager.get_trade_stats()
+        if stats["total"] > 0:
+            wr_color = "green" if stats["win_rate"] >= 50 else "red"
+            print(f"  Trades: {stats['total']}  |  W: {stats['wins']}  L: {stats['losses']}  BE: {stats['breakevens']}")
+            print(colored(f"  Win rate: {stats['win_rate']:.1f}%", wr_color))
 
         # Show current prices
         up_bid = self.clob_client.get_best_bid(self.config.up_token_id)

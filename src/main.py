@@ -13,8 +13,10 @@ from termcolor import colored
 from .clob_client import FastClobClient
 from .coinbase_feed import CoinbaseFeed
 from .config import Config
+from .data_logger import DataLogger
 from .order_executor import OrderExecutor
 from .position_manager import ExitReason, Position, PositionManager
+from .price_cache import PriceCache
 from .signal_controller import SignalController
 from .websocket_client import PriceStream
 
@@ -30,8 +32,10 @@ class TradingBot:
         self.price_stream: Optional[PriceStream] = None
         self.coinbase_feed: Optional[CoinbaseFeed] = None
         self.signal_controller: Optional[SignalController] = None
+        self.data_logger = DataLogger()
 
         self._running = False
+        self._shutdown_done = False
         self._in_exit_menu = False
         self._exit_menu_positions: list[Position] = []
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -65,13 +69,19 @@ class TradingBot:
             self.clob_client,
             self.config,
             on_exit_complete=self._on_exit_complete,
+            data_logger=self.data_logger,
         )
+
+        # Initialize price cache (WebSocket keeps it fresh; used by executor and signal controller)
+        self.price_cache = PriceCache(stale_ms=self.config.price_cache_stale_ms)
 
         # Initialize order executor
         self.order_executor = OrderExecutor(
             self.clob_client,
             self.config,
             self.position_manager,
+            price_cache=self.price_cache,
+            data_logger=self.data_logger,
         )
 
         # Initialize price stream
@@ -81,6 +91,7 @@ class TradingBot:
             on_price_update=self._on_price_update,
             on_connect=self._on_ws_connect,
             on_disconnect=self._on_ws_disconnect,
+            price_cache=self.price_cache,
         )
 
         # Initialize signal controller
@@ -89,6 +100,7 @@ class TradingBot:
             self.config,
             self.order_executor,
             self.position_manager,
+            price_cache=self.price_cache,
         )
 
         # Initialize Coinbase feed for BTC volatility detection
@@ -106,7 +118,43 @@ class TradingBot:
         print(f"  Volatility window: {self.config.volatility_window_ms}ms")
         print(f"  Max spread: {self.config.max_spread_pct * 100:.1f}%")
 
+        # Log session start for data capture
+        self.data_logger.log({
+            "type": "session_start",
+            "config": {
+                "position_size": self.config.position_size,
+                "take_profit_pct": self.config.take_profit_pct,
+                "stop_loss_pct": self.config.stop_loss_pct,
+                "trigger_threshold": self.config.trigger_threshold,
+                "signal_cooldown_ms": self.config.signal_cooldown_ms,
+                "volatility_window_ms": self.config.volatility_window_ms,
+                "max_spread_pct": self.config.max_spread_pct,
+                "stale_position_sec": self.config.stale_position_sec,
+                "price_cache_stale_ms": self.config.price_cache_stale_ms,
+            },
+            "market": {
+                "event_title": self.config.event_title,
+                "up_token_id": self.config.up_token_id,
+                "down_token_id": self.config.down_token_id,
+            },
+        })
+
         print(colored("Initialization complete.", "green"))
+
+    def _get_spread_snapshot(self, token_id: str) -> dict | None:
+        """Get Polymarket bid/ask/spread for logging."""
+        if not self.price_cache:
+            return None
+        snapshot = self.price_cache.get(token_id)
+        if not snapshot or snapshot.best_bid is None or snapshot.best_ask is None:
+            return None
+        spread_pct = (snapshot.best_ask - snapshot.best_bid) / snapshot.best_bid if snapshot.best_bid > 0 else None
+        return {
+            "token_id": token_id,
+            "best_bid": snapshot.best_bid,
+            "best_ask": snapshot.best_ask,
+            "spread_pct": spread_pct,
+        }
 
     def _on_price_update(self, token_id: str, best_bid: float, best_ask: float):
         """Handle price update from WebSocket (silent - only triggers TP/SL checks)."""
@@ -123,32 +171,52 @@ class TradingBot:
         timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
         print(colored(f"[{timestamp}] WebSocket disconnected, reconnecting...", "yellow"))
 
-    def _on_coinbase_signal(self, direction: str):
+    async def _on_coinbase_signal(self, direction: str):
         """Handle volatility signal from Coinbase feed."""
         timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
         print(colored(f"[{timestamp}] AUTO-SIGNAL: {direction}", "magenta"))
 
-        # Check conditions via signal controller (but don't execute yet)
-        if not self.signal_controller.is_enabled:
-            return
-
-        # Check position limit
         token_id = (
             self.config.up_token_id if direction == "UP"
             else self.config.down_token_id
         )
-        for pos in self.position_manager.list_open_positions():
-            if pos.token_id == token_id:
-                print(colored(f"[{timestamp}]   Skipped: position already open", "yellow"))
-                return
 
-        # Check spread
-        if not self.signal_controller._check_spread(token_id):
+        # Get signal data and Polymarket spread snapshot for logging
+        signal_data = getattr(self.coinbase_feed, "_last_signal_data", None)
+        spread_snapshot = self._get_spread_snapshot(token_id)
+
+        # Determine outcome
+        outcome = "executed"
+        if not self.signal_controller.is_enabled:
+            outcome = "skipped_disabled"
+            print(colored(f"[{timestamp}]   Skipped: auto-signals disabled", "yellow"))
+        elif any(pos.token_id == token_id for pos in self.position_manager.list_open_positions()):
+            outcome = "skipped_position_open"
+            print(colored(f"[{timestamp}]   Skipped: position already open", "yellow"))
+        elif not self.signal_controller._check_spread(token_id):
+            outcome = "skipped_spread_wide"
             print(colored(f"[{timestamp}]   Skipped: spread too wide", "yellow"))
+
+        # Log signal event (always, including skipped)
+        self.data_logger.log({
+            "type": "signal",
+            "direction": direction,
+            "outcome": outcome,
+            "pct_change": signal_data["pct_change"] if signal_data else None,
+            "threshold": self.config.trigger_threshold,
+            "window_ticks": signal_data["window_ticks"] if signal_data else [],
+            "signal_time_ms": signal_data["signal_time_ms"] if signal_data else None,
+            "polymarket_spread": spread_snapshot,
+        })
+
+        if outcome != "executed":
             return
 
-        # Execute entry and show result
-        result = self.order_executor.execute_entry(direction)
+        # Execute entry in thread executor (non-blocking for event loop)
+        loop = self._loop or asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, self.order_executor.execute_entry, direction
+        )
         output = self.order_executor.format_entry_result(result)
         print(output)
 
@@ -190,9 +258,15 @@ class TradingBot:
             return
 
         if char == "u":
-            self._place_entry("UP")
+            asyncio.run_coroutine_threadsafe(
+                self._place_entry_async("UP"),
+                self._loop,
+            )
         elif char == "d":
-            self._place_entry("DOWN")
+            asyncio.run_coroutine_threadsafe(
+                self._place_entry_async("DOWN"),
+                self._loop,
+            )
         elif char == "k":
             self._toggle_auto_signals()
         elif char == "x":
@@ -218,21 +292,29 @@ class TradingBot:
                 self._exit_menu_positions = []
 
                 print(f"Closing position {position.id}...")
-                if self.order_executor.execute_exit(position.id):
-                    pass  # Exit callback will print result
-                else:
+                future = asyncio.run_coroutine_threadsafe(
+                    self.order_executor.execute_exit(position.id),
+                    self._loop,
+                )
+                try:
+                    if not future.result(timeout=30):
+                        print(colored("Failed to initiate exit", "red"))
+                except Exception:
                     print(colored("Failed to initiate exit", "red"))
             else:
                 print(colored(f"Invalid selection: {selection}", "yellow"))
         except ValueError:
             pass
 
-    def _place_entry(self, direction: str):
-        """Place an entry order."""
+    async def _place_entry_async(self, direction: str):
+        """Place an entry order (runs on event loop, entry I/O in executor)."""
         timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
         print(f"[{timestamp}] Placing Buy {direction} order...")
 
-        result = self.order_executor.execute_entry(direction)
+        loop = self._loop or asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, self.order_executor.execute_entry, direction
+        )
         output = self.order_executor.format_entry_result(result)
         print(output)
 
@@ -300,7 +382,11 @@ class TradingBot:
         print()
 
     def _shutdown(self):
-        """Shutdown the bot."""
+        """Shutdown the bot (idempotent)."""
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+
         timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
         print(colored(f"\n[{timestamp}] Shutting down...", "yellow"))
 
@@ -309,6 +395,19 @@ class TradingBot:
             self.price_stream.stop()
         if self.coinbase_feed:
             self.coinbase_feed.stop()
+
+        # Log session end and close data logger
+        if self.position_manager:
+            realized = self.position_manager.get_total_pnl()
+            open_positions = self.position_manager.list_open_positions()
+            trade_count = len([p for p in self.position_manager.positions.values() if p.exit_reason is not None])
+            self.data_logger.log({
+                "type": "session_end",
+                "total_realized_pnl": realized,
+                "trade_count": trade_count,
+                "open_positions_remaining": len(open_positions),
+            })
+        self.data_logger.close()
 
     def _stdin_reader(self):
         """Read single keystrokes from stdin in raw mode (runs in thread)."""
@@ -355,6 +454,8 @@ class TradingBot:
         try:
             asyncio.run(self.run_async())
         except KeyboardInterrupt:
+            pass  # _shutdown already called via 'q' or will be called below
+        finally:
             self._shutdown()
 
         # Final summary

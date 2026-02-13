@@ -42,11 +42,13 @@ class OrderExecutor:
         config: Config,
         position_manager: PositionManager,
         price_cache: Optional["PriceCache"] = None,
+        data_logger: Optional[object] = None,
     ):
         self.clob_client = clob_client
         self.config = config
         self.position_manager = position_manager
         self.price_cache = price_cache
+        self.data_logger = data_logger
 
     def execute_entry(self, direction: str, dollar_amount: Optional[float] = None) -> OrderResult:
         """
@@ -72,12 +74,16 @@ class OrderExecutor:
         if self.price_cache is not None:
             best_ask = self.price_cache.get_best_ask(token_id)
             best_bid = self.price_cache.get_best_bid(token_id)
+            age = self.price_cache.get_age_ms(token_id)
+            age_str = f"{age:.0f}ms" if age is not None else "N/A"
+            print(f"  [DEBUG] Prices from cache (age: {age_str})")
         else:
             best_ask = self.clob_client.get_best_ask(token_id)
             best_bid = self.clob_client.get_best_bid(token_id)
+            print("  [DEBUG] Prices from REST (no cache)")
 
         if not best_ask:
-            return OrderResult(
+            order_result = OrderResult(
                 success=False,
                 direction=direction,
                 requested_amount=dollar_amount,
@@ -85,6 +91,8 @@ class OrderExecutor:
                 fill_price=0.0,
                 error_msg="No asks available in orderbook",
             )
+            self._log_entry(order_result, token_id, best_bid, best_ask)
+            return order_result
 
         # Place market buy order (pass cached price to avoid REST call)
         result = self.clob_client.place_market_buy(token_id, dollar_amount, price=best_ask)
@@ -104,7 +112,7 @@ class OrderExecutor:
                     entry_bid=best_bid,
                 )
 
-                return OrderResult(
+                order_result = OrderResult(
                     success=True,
                     direction=direction,
                     requested_amount=dollar_amount,
@@ -113,8 +121,10 @@ class OrderExecutor:
                     position=position,
                     partial_fill=(filled_shares < dollar_amount / best_ask * 0.95),
                 )
+                self._log_entry(order_result, token_id, best_bid, best_ask)
+                return order_result
             else:
-                return OrderResult(
+                order_result = OrderResult(
                     success=False,
                     direction=direction,
                     requested_amount=dollar_amount,
@@ -122,8 +132,10 @@ class OrderExecutor:
                     fill_price=0.0,
                     error_msg="Order submitted but no fill received",
                 )
+                self._log_entry(order_result, token_id, best_bid, best_ask)
+                return order_result
         else:
-            return OrderResult(
+            order_result = OrderResult(
                 success=False,
                 direction=direction,
                 requested_amount=dollar_amount,
@@ -131,8 +143,41 @@ class OrderExecutor:
                 fill_price=0.0,
                 error_msg=result.get("errorMsg", "Unknown error"),
             )
+            self._log_entry(order_result, token_id, best_bid, best_ask)
+            return order_result
 
-    def execute_exit(self, position_id: str) -> bool:
+    def _log_entry(
+        self,
+        result: OrderResult,
+        token_id: str,
+        best_bid: Optional[float],
+        best_ask: Optional[float],
+    ) -> None:
+        """Log entry event to data logger (non-blocking)."""
+        if not self.data_logger:
+            return
+        spread_snapshot = None
+        if best_bid is not None and best_ask is not None and best_bid > 0:
+            spread_snapshot = {
+                "token_id": token_id,
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "spread_pct": (best_ask - best_bid) / best_bid,
+            }
+        self.data_logger.log({
+            "type": "entry",
+            "direction": result.direction,
+            "token_id": token_id,
+            "requested_amount": result.requested_amount,
+            "filled_shares": result.filled_shares,
+            "fill_price": result.fill_price,
+            "partial_fill": result.partial_fill,
+            "success": result.success,
+            "error_msg": result.error_msg,
+            "polymarket_spread": spread_snapshot,
+        })
+
+    async def execute_exit(self, position_id: str) -> bool:
         """
         Execute a manual exit for a position.
 
@@ -142,7 +187,7 @@ class OrderExecutor:
         Returns:
             True if exit was initiated
         """
-        return self.position_manager.manual_exit(position_id)
+        return await self.position_manager.manual_exit(position_id)
 
     def format_entry_result(self, result: OrderResult) -> str:
         """Format entry result for display."""

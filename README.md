@@ -44,6 +44,34 @@ A Python terminal application for fast manual trading on Polymarket's Bitcoin Up
    python3.11 run_bot.py
    ```
 
+## VPS Setup & Run
+
+On a headless Ubuntu VPS (e.g. DigitalOcean), the system Python is typically 3.12 and `pip3.11` won't exist. Use a virtual environment instead:
+
+1. **Create a virtual environment and install dependencies:**
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
+   ```
+
+2. **Copy `.env.example` to `.env`** and fill in your credentials:
+   ```bash
+   cp .env.example .env
+   ```
+
+3. **Run the market mapper:**
+   ```bash
+   python3 run_mapper.py
+   ```
+
+4. **Run the bot:**
+   ```bash
+   python3 run_bot.py
+   ```
+
+> **Note:** You only need to run `source venv/bin/activate` once per SSH session. After that, `python3` and `pip` will use the venv automatically.
+
 ## Keyboard Controls
 
 | Key | Action |

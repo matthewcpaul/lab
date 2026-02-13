@@ -101,6 +101,7 @@ class CoinbaseFeed:
         self.on_disconnect = on_disconnect
 
         self._last_signal_time: float = 0
+        self._last_signal_data: Optional[dict] = None  # Snapshot when signal fires (for data logging)
         self._running = False
         self._paused = False
         self._ws = None
@@ -260,6 +261,14 @@ class CoinbaseFeed:
         # Queue signal (non-blocking - doesn't wait for processing)
         direction = "UP" if pct_change > 0 else "DOWN"
         self._last_signal_time = current_time_ms
+
+        # Stash window snapshot for data logging (rolling window ticks)
+        self._last_signal_data = {
+            "pct_change": pct_change,
+            "direction": direction,
+            "window_ticks": [{"time_ms": t, "price": p} for t, p in self.window._data],
+            "signal_time_ms": current_time_ms,
+        }
 
         # put_nowait is non-blocking - if queue is full, raises QueueFull
         # We use an unbounded queue so this won't happen in practice

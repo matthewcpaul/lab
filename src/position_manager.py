@@ -71,10 +71,12 @@ class PositionManager:
         clob_client: FastClobClient,
         config: Config,
         on_exit_complete: Optional[Callable[[Position, ExitReason], None]] = None,
+        data_logger: Optional[object] = None,
     ):
         self.clob_client = clob_client
         self.config = config
         self.on_exit_complete = on_exit_complete
+        self.data_logger = data_logger
 
         self.positions: dict[str, Position] = {}
         self._exit_lock = asyncio.Lock()
@@ -95,24 +97,22 @@ class PositionManager:
             token_id: Token ID
             entry_price: Price we paid (ASK)
             shares: Number of shares
-            entry_bid: Current BID at entry time (what we'd get if we sold now)
-                       TP/SL are calculated from this, not entry_price, to account for spread.
+            entry_bid: Current BID at entry time; used for SL only. TP is from entry_price.
         """
         position_id = str(uuid.uuid4())[:8]
 
-        # Calculate TP/SL from the BID price (what we'd actually get when selling)
-        # This accounts for the spread so TP/SL don't trigger instantly
-        # If no bid provided, fall back to entry_price (less accurate)
-        reference_price = entry_bid if entry_bid and entry_bid > 0 else entry_price
+        # TP from entry_price (ask): target is above what we paid
+        tp_price = round(entry_price * (1 + self.config.take_profit_pct), 2)
 
-        tp_price = round(reference_price * (1 + self.config.take_profit_pct), 2)
-        sl_price = round(reference_price * (1 - self.config.stop_loss_pct), 2)
+        # SL from bid: triggers when bid drops below threshold
+        sl_reference = entry_bid if entry_bid and entry_bid > 0 else entry_price
+        sl_price = round(sl_reference * (1 - self.config.stop_loss_pct), 2)
 
-        # Ensure TP > current bid and SL < current bid by at least $0.01
-        if tp_price <= reference_price:
-            tp_price = round(reference_price + 0.01, 2)
-        if sl_price >= reference_price:
-            sl_price = round(reference_price - 0.01, 2)
+        # Guards: TP at least one tick above entry; SL at least one tick below reference
+        if tp_price <= entry_price:
+            tp_price = round(entry_price + 0.01, 2)
+        if sl_price >= sl_reference:
+            sl_price = round(sl_reference - 0.01, 2)
 
         position = Position(
             id=position_id,
@@ -195,13 +195,15 @@ class PositionManager:
         async with self._exit_lock:
             if position.status != PositionStatus.OPEN:
                 return  # Already being closed
-            self.trigger_exit(position, reason)
+            position.status = PositionStatus.CLOSING  # prevent re-entry
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self.trigger_exit, position, reason, trigger_price)
 
     # Dust threshold: remaining shares worth less than this are not worth
     # aggressively retrying via FAK. A GTC limit sell is placed instead.
     DUST_THRESHOLD_DOLLARS = 0.05
 
-    def trigger_exit(self, position: Position, reason: ExitReason):
+    def trigger_exit(self, position: Position, reason: ExitReason, trigger_bid: Optional[float] = None):
         """
         Execute exit order with aggressive retry.
 
@@ -212,10 +214,14 @@ class PositionManager:
 
         Logs each partial fill inline as it happens.
         """
-        if position.status != PositionStatus.OPEN:
+        if position.status == PositionStatus.CLOSED:
             return
 
         position.status = PositionStatus.CLOSING
+
+        # Capture spread at trigger time for data logging
+        spread_at_trigger = self._get_spread_snapshot(position.token_id)
+
         remaining = position.shares
         total_filled = 0.0
         fill_prices = []
@@ -269,9 +275,63 @@ class PositionManager:
         position.exit_time = datetime.now(timezone.utc)
         position.exit_reason = reason
 
+        # Capture spread at fill time and log exit event
+        spread_at_fill = self._get_spread_snapshot(position.token_id)
+        self._log_exit(position, reason, fill_prices, spread_at_trigger, spread_at_fill, trigger_bid)
+
         # Notify callback (prints P&L summary)
         if self.on_exit_complete:
             self.on_exit_complete(position, reason)
+
+    def _get_spread_snapshot(self, token_id: str) -> Optional[dict]:
+        """Get Polymarket bid/ask/spread for logging."""
+        best_bid = self.clob_client.get_best_bid(token_id)
+        best_ask = self.clob_client.get_best_ask(token_id)
+        if best_bid is None or best_ask is None or best_bid <= 0:
+            return None
+        return {
+            "token_id": token_id,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread_pct": (best_ask - best_bid) / best_bid,
+        }
+
+    def _log_exit(
+        self,
+        position: Position,
+        reason: ExitReason,
+        fill_prices: list[tuple[float, float]],
+        spread_at_trigger: Optional[dict],
+        spread_at_fill: Optional[dict],
+        trigger_bid: Optional[float] = None,
+    ) -> None:
+        """Log exit event to data logger (non-blocking)."""
+        if not self.data_logger:
+            return
+        pnl_dollars = 0.0
+        pnl_pct = 0.0
+        if position.exit_price and position.entry_price > 0:
+            pnl_dollars = (position.exit_price - position.entry_price) * position.shares
+            pnl_pct = ((position.exit_price - position.entry_price) / position.entry_price) * 100
+        fill_details = [{"qty": q, "price": p} for q, p in fill_prices]
+        event = {
+            "type": "exit",
+            "position_id": position.id,
+            "direction": position.direction,
+            "token_id": position.token_id,
+            "reason": reason.value,
+            "entry_price": position.entry_price,
+            "exit_price": position.exit_price,
+            "shares": position.shares,
+            "pnl_dollars": pnl_dollars,
+            "pnl_pct": pnl_pct,
+            "fill_details": fill_details,
+            "polymarket_spread_at_trigger": spread_at_trigger,
+            "polymarket_spread_at_fill": spread_at_fill,
+        }
+        if trigger_bid is not None:
+            event["trigger_bid"] = trigger_bid
+        self.data_logger.log(event)
 
     def _place_dust_gtc(self, position: Position, remaining: float, best_bid: float):
         """Place a GTC limit sell for dust shares that couldn't be sold via FAK."""
@@ -379,7 +439,7 @@ class PositionManager:
 
         return remaining, total_filled, fill_prices
 
-    def manual_exit(self, position_id: str) -> bool:
+    async def manual_exit(self, position_id: str) -> bool:
         """
         Manually close a position.
 
@@ -390,7 +450,9 @@ class PositionManager:
         if not position or position.status != PositionStatus.OPEN:
             return False
 
-        self.trigger_exit(position, ExitReason.MANUAL)
+        position.status = PositionStatus.CLOSING
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.trigger_exit, position, ExitReason.MANUAL, None)
         return True
 
     def get_total_pnl(self) -> float:

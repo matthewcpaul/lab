@@ -1,6 +1,7 @@
 .env
 market_map.json
 /data/
+/ai-analysis/
 __pycache__/
 *.pyc
 .venv/

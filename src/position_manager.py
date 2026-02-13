@@ -180,7 +180,9 @@ class PositionManager:
 
             # Stale breakeven exit: if stale AND can exit at breakeven or better
             # If underwater, wait for price to recover or hit stop loss
-            if pos.is_stale and current_bid >= pos.entry_price:
+            # Note: entry_price is the ASK we paid, but we sell at BID. We need
+            # bid >= entry + 1 tick to actually break even after spread cost.
+            if pos.is_stale and current_bid >= pos.entry_price + 0.01:
                 asyncio.create_task(
                     self._async_trigger_exit(pos, ExitReason.STALE_BREAKEVEN, current_bid)
                 )

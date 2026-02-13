@@ -6,6 +6,6 @@
   "trigger_threshold": 0.00015,
   "volatility_window_ms": 500,
   "signal_cooldown_ms": 2000,
-  "stale_position_sec": 5.0,
+  "stale_position_sec": 10.0,
   "price_cache_stale_ms": 5000
 }

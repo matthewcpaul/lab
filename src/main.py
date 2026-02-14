@@ -346,37 +346,7 @@ class TradingBot:
         timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
         positions = self.position_manager.list_open_positions()
 
-        print(f"\n[{timestamp}] --- Status ---")
-        print(f"  Open positions: {len(positions)}")
-
-        if positions:
-            total_unrealized = 0.0
-            for pos in positions:
-                bid = self.clob_client.get_best_bid(pos.token_id)
-                if bid:
-                    total_unrealized += pos.pnl(bid)
-                summary = self.position_manager.get_position_summary(pos)
-                print(f"    [{pos.id}] {summary}")
-            pnl_color = "green" if total_unrealized >= 0 else "red"
-            print(colored(f"  Unrealized P&L: ${total_unrealized:+.2f}", pnl_color))
-
-        realized = self.position_manager.get_total_pnl()
-        if realized != 0:
-            pnl_color = "green" if realized >= 0 else "red"
-            print(colored(f"  Realized P&L: ${realized:+.2f}", pnl_color))
-
-        # Trade stats
-        stats = self.position_manager.get_trade_stats()
-        if stats["total"] > 0:
-            wr_color = "green" if stats["win_rate"] >= 50 else "red"
-            print(f"  Trades: {stats['total']}  |  W: {stats['wins']}  L: {stats['losses']}  BE: {stats['breakevens']}")
-            print(colored(f"  Win rate: {stats['win_rate']:.1f}%", wr_color))
-
-        # Show current prices
-        up_bid = self.clob_client.get_best_bid(self.config.up_token_id)
-        down_bid = self.clob_client.get_best_bid(self.config.down_token_id)
-        print(f"  UP price:   ${up_bid:.2f}" if up_bid else "  UP price:   N/A")
-        print(f"  DOWN price: ${down_bid:.2f}" if down_bid else "  DOWN price: N/A")
+        print(f"\n[{timestamp}] Status")
 
         # Show Coinbase feed state
         cb_connected = self.coinbase_feed.is_connected if self.coinbase_feed else False
@@ -387,8 +357,33 @@ class TradingBot:
         auto_status = "PAUSED" if not auto_enabled else "active"
         status_color = "green" if (cb_connected and auto_enabled) else "yellow"
 
-        print(colored(f"  Coinbase: {cb_status} | Auto-signals: {auto_status}", status_color))
-        print()
+        print(colored(f"           Coinbase: {cb_status} | Auto-signals: {auto_status}", status_color))
+        
+        # Show # of open positions
+        print(f"           Open positions: {len(positions)}")
+
+        # Trade stats
+        stats = self.position_manager.get_trade_stats()
+        wr_color = "green" if stats["win_rate"] >= 50 else "red"
+        print(f"           Trades: {stats['total']}  |  W: {stats['wins']}  L: {stats['losses']}  BE: {stats['breakevens']}")
+        print(colored(f"           Win rate: {stats['win_rate']:.1f}%", wr_color))
+
+        # Show total P&L
+        if positions:
+            total_unrealized = 0.0
+            for pos in positions:
+                bid = self.clob_client.get_best_bid(pos.token_id)
+                if bid:
+                    total_unrealized += pos.pnl(bid)
+                summary = self.position_manager.get_position_summary(pos)
+                print(f"    [{pos.id}] {summary}")
+            pnl_color = "green" if total_unrealized >= 0 else "red"
+            print(colored(f"           Unrealized P&L: ${total_unrealized:+.2f}", pnl_color))
+
+        realized = self.position_manager.get_total_pnl()
+        if realized != 0:
+            pnl_color = "green" if realized >= 0 else "red"
+            print(colored(f"           Realized P&L: ${realized:+.2f}", pnl_color))
 
     def _shutdown(self):
         """Shutdown the bot (idempotent)."""
@@ -468,7 +463,7 @@ class TradingBot:
             self._shutdown()
 
         # Final summary
-        print("\n--- Session Summary ---")
+        print("\nSession Summary")
         realized = self.position_manager.get_total_pnl()
         pnl_color = "green" if realized >= 0 else "red"
         print(colored(f"Total P&L: ${realized:+.2f}", pnl_color))

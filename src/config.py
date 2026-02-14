@@ -165,6 +165,11 @@ class Config:
         return self.params.get("price_cache_stale_ms", 5000)
 
     @property
+    def slippage_cents(self) -> int:
+        """Cents of slippage tolerance for FAK order fill reliability."""
+        return self.params.get("slippage_cents", 2)
+
+    @property
     def up_token_id(self) -> str:
         if not self.market:
             raise ValueError("Market not loaded. Call load_market() first.")

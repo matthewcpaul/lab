@@ -141,7 +141,8 @@ class FastClobClient:
         return 0.0, float(Decimal(str(price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
 
     def place_market_buy(
-        self, token_id: str, dollar_amount: float, price: Optional[float] = None
+        self, token_id: str, dollar_amount: float, price: Optional[float] = None,
+        slippage_cents: int = 0,
     ) -> dict:
         """
         Place a market buy order (FAK at best ask).
@@ -150,6 +151,7 @@ class FastClobClient:
             token_id: The token to buy
             dollar_amount: Amount in dollars to spend
             price: Optional price to use (skips REST call if provided)
+            slippage_cents: Cents of slippage tolerance added to limit price
 
         Returns:
             Order result dict with 'success', 'orderID', etc.
@@ -158,6 +160,10 @@ class FastClobClient:
         best_ask = price if price is not None else self.get_best_ask(token_id)
         if not best_ask:
             return {"success": False, "errorMsg": "No asks available"}
+
+        # Apply slippage tolerance for FAK fill reliability
+        if slippage_cents > 0:
+            best_ask = min(best_ask + slippage_cents / 100, 0.99)
 
         # Use Decimal for precise calculation
         d_price = Decimal(str(best_ask)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
@@ -187,7 +193,10 @@ class FastClobClient:
         except Exception as e:
             return {"success": False, "errorMsg": str(e)}
 
-    def place_market_sell(self, token_id: str, shares: float, price: Optional[float] = None) -> dict:
+    def place_market_sell(
+        self, token_id: str, shares: float, price: Optional[float] = None,
+        slippage_cents: int = 0,
+    ) -> dict:
         """
         Place a market sell order (FAK at best bid or specified price).
 
@@ -195,6 +204,7 @@ class FastClobClient:
             token_id: The token to sell
             shares: Number of shares to sell
             price: Optional price override (uses best bid if not specified)
+            slippage_cents: Cents of slippage tolerance subtracted from limit price
 
         Returns:
             Order result dict with 'success', 'orderID', etc.
@@ -203,6 +213,10 @@ class FastClobClient:
             price = self.get_best_bid(token_id)
         if not price:
             return {"success": False, "errorMsg": "No bids available"}
+
+        # Apply slippage tolerance for FAK fill reliability
+        if slippage_cents > 0:
+            price = max(price - slippage_cents / 100, 0.01)
 
         # Use Decimal math to ensure product has ≤2 decimals
         clean_size, clean_price = self._clean_order_amounts(shares, price)

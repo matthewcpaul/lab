@@ -438,6 +438,7 @@ class PositionManager:
                 token_id,
                 remaining,
                 price=best_bid,
+                slippage_cents=self.config.slippage_cents,
             )
 
             if result.get("success"):

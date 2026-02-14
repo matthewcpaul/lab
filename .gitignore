@@ -2,6 +2,7 @@
 market_map.json
 /data/
 /ai-analysis/
+/jp-messages/
 __pycache__/
 *.pyc
 .venv/

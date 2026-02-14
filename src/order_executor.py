@@ -95,7 +95,10 @@ class OrderExecutor:
             return order_result
 
         # Place market buy order (pass cached price to avoid REST call)
-        result = self.clob_client.place_market_buy(token_id, dollar_amount, price=best_ask)
+        result = self.clob_client.place_market_buy(
+            token_id, dollar_amount, price=best_ask,
+            slippage_cents=self.config.slippage_cents,
+        )
 
         if result.get("success"):
             filled_shares = result.get("filled", 0.0)

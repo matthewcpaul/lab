@@ -1,6 +1,8 @@
 """Fast order execution with retry logic and partial fill handling."""
 
-from dataclasses import dataclass
+import time
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
@@ -26,6 +28,11 @@ class OrderResult:
     position: Optional[Position] = None
     error_msg: Optional[str] = None
     partial_fill: bool = False
+    timing_ms: dict = field(default_factory=dict)
+    position_id: Optional[str] = None
+    limit_price: Optional[float] = None
+    requested_shares: Optional[float] = None
+    order_id: Optional[str] = None
 
 
 class OrderExecutor:
@@ -49,6 +56,7 @@ class OrderExecutor:
         self.position_manager = position_manager
         self.price_cache = price_cache
         self.data_logger = data_logger
+        self.coinbase_feed = None  # Set after CoinbaseFeed init for btc_price logging
 
     def execute_entry(self, direction: str, dollar_amount: Optional[float] = None) -> OrderResult:
         """
@@ -61,6 +69,8 @@ class OrderExecutor:
         Returns:
             OrderResult with execution details
         """
+        t_start = time.perf_counter()
+
         if dollar_amount is None:
             dollar_amount = self.config.position_size
 
@@ -71,6 +81,7 @@ class OrderExecutor:
 
         # Get best ask for entry and best bid for TP/SL calculation
         # Use price cache for low-latency reads, fallback to REST
+        t_cache = time.perf_counter()
         if self.price_cache is not None:
             best_ask = self.price_cache.get_best_ask(token_id)
             best_bid = self.price_cache.get_best_bid(token_id)
@@ -81,8 +92,11 @@ class OrderExecutor:
             best_ask = self.clob_client.get_best_ask(token_id)
             best_bid = self.clob_client.get_best_bid(token_id)
             print("   [DEBUG] Prices from REST (no cache)")
+        cache_read_ms = (time.perf_counter() - t_cache) * 1000
 
         if not best_ask:
+            total_ms = (time.perf_counter() - t_start) * 1000
+            timing = {"cache_read_ms": round(cache_read_ms, 1), "total_ms": round(total_ms, 1)}
             order_result = OrderResult(
                 success=False,
                 direction=direction,
@@ -90,16 +104,34 @@ class OrderExecutor:
                 filled_shares=0.0,
                 fill_price=0.0,
                 error_msg="No asks available in orderbook",
+                timing_ms=timing,
             )
             self._log_entry(order_result, token_id, best_bid, best_ask)
             return order_result
 
+        # Pre-generate position ID for correlation across entry/exit logs
+        position_id = str(uuid.uuid4())[:8]
+
+        # Calculate the limit price that will be submitted to the exchange
+        limit_price = best_ask
+        if self.config.slippage_cents > 0:
+            limit_price = min(best_ask + self.config.slippage_cents / 100, 0.99)
+
         # Place market buy order (pass cached price to avoid REST call)
+        # The CLOB client internally does: create_order (ECDSA signing) + post_order (HTTP)
+        t_order = time.perf_counter()
         result = self.clob_client.place_market_buy(
             token_id, dollar_amount, price=best_ask,
             slippage_cents=self.config.slippage_cents,
         )
+        order_ms = (time.perf_counter() - t_order) * 1000
 
+        # Capture order metadata for logging
+        order_id = result.get("orderID")
+        requested_shares_submitted = result.get("requested")
+
+        # Parse response
+        t_parse = time.perf_counter()
         if result.get("success"):
             filled_shares = result.get("filled", 0.0)
             fill_price = result.get("price", best_ask)
@@ -113,7 +145,16 @@ class OrderExecutor:
                     entry_price=fill_price,
                     shares=filled_shares,
                     entry_bid=best_bid,
+                    position_id=position_id,
                 )
+                parse_ms = (time.perf_counter() - t_parse) * 1000
+                total_ms = (time.perf_counter() - t_start) * 1000
+                timing = {
+                    "cache_read_ms": round(cache_read_ms, 1),
+                    "order_ms": round(order_ms, 1),
+                    "parse_ms": round(parse_ms, 1),
+                    "total_ms": round(total_ms, 1),
+                }
 
                 order_result = OrderResult(
                     success=True,
@@ -123,10 +164,23 @@ class OrderExecutor:
                     fill_price=fill_price,
                     position=position,
                     partial_fill=(filled_shares < dollar_amount / best_ask * 0.95),
+                    timing_ms=timing,
+                    position_id=position_id,
+                    limit_price=limit_price,
+                    requested_shares=requested_shares_submitted,
+                    order_id=order_id,
                 )
                 self._log_entry(order_result, token_id, best_bid, best_ask)
                 return order_result
             else:
+                parse_ms = (time.perf_counter() - t_parse) * 1000
+                total_ms = (time.perf_counter() - t_start) * 1000
+                timing = {
+                    "cache_read_ms": round(cache_read_ms, 1),
+                    "order_ms": round(order_ms, 1),
+                    "parse_ms": round(parse_ms, 1),
+                    "total_ms": round(total_ms, 1),
+                }
                 order_result = OrderResult(
                     success=False,
                     direction=direction,
@@ -134,10 +188,23 @@ class OrderExecutor:
                     filled_shares=0.0,
                     fill_price=0.0,
                     error_msg="Order submitted but no fill received",
+                    timing_ms=timing,
+                    position_id=position_id,
+                    limit_price=limit_price,
+                    requested_shares=requested_shares_submitted,
+                    order_id=order_id,
                 )
                 self._log_entry(order_result, token_id, best_bid, best_ask)
                 return order_result
         else:
+            parse_ms = (time.perf_counter() - t_parse) * 1000
+            total_ms = (time.perf_counter() - t_start) * 1000
+            timing = {
+                "cache_read_ms": round(cache_read_ms, 1),
+                "order_ms": round(order_ms, 1),
+                "parse_ms": round(parse_ms, 1),
+                "total_ms": round(total_ms, 1),
+            }
             order_result = OrderResult(
                 success=False,
                 direction=direction,
@@ -145,6 +212,11 @@ class OrderExecutor:
                 filled_shares=0.0,
                 fill_price=0.0,
                 error_msg=result.get("errorMsg", "Unknown error"),
+                timing_ms=timing,
+                position_id=position_id,
+                limit_price=limit_price,
+                requested_shares=requested_shares_submitted,
+                order_id=order_id,
             )
             self._log_entry(order_result, token_id, best_bid, best_ask)
             return order_result
@@ -167,17 +239,28 @@ class OrderExecutor:
                 "best_ask": best_ask,
                 "spread_cents": round((best_ask - best_bid) * 100),
             }
+        # Get BTC price at fill time from Coinbase feed
+        btc_price = None
+        if self.coinbase_feed is not None:
+            btc_price = self.coinbase_feed.latest_price or None
+
         self.data_logger.log({
             "type": "entry",
+            "position_id": result.position_id,
             "direction": result.direction,
             "token_id": token_id,
             "requested_amount": result.requested_amount,
+            "limit_price": result.limit_price,
+            "requested_shares": result.requested_shares,
             "filled_shares": result.filled_shares,
             "fill_price": result.fill_price,
+            "order_id": result.order_id,
             "partial_fill": result.partial_fill,
             "success": result.success,
             "error_msg": result.error_msg,
+            "btc_price_at_fill": btc_price,
             "polymarket_spread": spread_snapshot,
+            "timing_ms": result.timing_ms if result.timing_ms else None,
         })
 
     async def execute_exit(self, position_id: str) -> bool:

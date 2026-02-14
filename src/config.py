@@ -170,6 +170,11 @@ class Config:
         return self.params.get("slippage_cents", 2)
 
     @property
+    def reconnect_cooldown_ms(self) -> int:
+        """Milliseconds to skip signals after a Polymarket WS reconnect."""
+        return self.params.get("reconnect_cooldown_ms", 5000)
+
+    @property
     def up_token_id(self) -> str:
         if not self.market:
             raise ValueError("Market not loaded. Call load_market() first.")

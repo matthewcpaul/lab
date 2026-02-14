@@ -1,12 +1,13 @@
 {
   "position_size": 2.00,
-  "take_profit_pct": 0.03,
-  "stop_loss_pct": 0.03,
-  "max_spread_cents": 2,
+  "take_profit_pct": 0.04,
+  "stop_loss_pct": 0.02,
+  "max_spread_cents": 1,
   "trigger_threshold": 0.00015,
-  "volatility_window_ms": 500,
+  "volatility_window_ms": 300,
   "signal_cooldown_ms": 2000,
-  "stale_position_sec": 10.0,
+  "stale_position_sec": 6,
   "price_cache_stale_ms": 5000,
-  "slippage_cents": 2
+  "slippage_cents": 1,
+  "reconnect_cooldown_ms": 5000
 }

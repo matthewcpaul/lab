@@ -4,6 +4,7 @@ import asyncio
 import sys
 import termios
 import threading
+import time
 import tty
 from datetime import datetime, timezone
 from typing import Optional
@@ -15,7 +16,7 @@ from .coinbase_feed import CoinbaseFeed
 from .config import Config
 from .data_logger import DataLogger
 from .order_executor import OrderExecutor
-from .position_manager import ExitReason, Position, PositionManager
+from .position_manager import ExitReason, Position, PositionManager, PositionStatus
 from .price_cache import PriceCache
 from .signal_controller import SignalController
 from .websocket_client import PriceStream
@@ -39,6 +40,7 @@ class TradingBot:
         self._in_exit_menu = False
         self._exit_menu_positions: list[Position] = []
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._last_polymarket_reconnect_ms: float = 0
 
     def initialize(self):
         """Initialize all components."""
@@ -94,6 +96,7 @@ class TradingBot:
             on_connect=self._on_ws_connect,
             on_disconnect=self._on_ws_disconnect,
             price_cache=self.price_cache,
+            data_logger=self.data_logger,
         )
 
         # Initialize signal controller
@@ -113,7 +116,11 @@ class TradingBot:
             on_signal=self._on_coinbase_signal,
             on_connect=self._on_coinbase_connect,
             on_disconnect=self._on_coinbase_disconnect,
+            data_logger=self.data_logger,
         )
+
+        # Wire CoinbaseFeed reference to OrderExecutor for btc_price logging
+        self.order_executor.coinbase_feed = self.coinbase_feed
 
         print(f"  Trigger threshold: {self.config.trigger_threshold * 100:.3f}%")
         print(f"  Signal cooldown: {self.config.signal_cooldown_ms}ms")
@@ -133,6 +140,7 @@ class TradingBot:
                 "max_spread_cents": self.config.max_spread_cents,
                 "stale_position_sec": self.config.stale_position_sec,
                 "price_cache_stale_ms": self.config.price_cache_stale_ms,
+                "reconnect_cooldown_ms": self.config.reconnect_cooldown_ms,
             },
             "market": {
                 "event_title": self.config.event_title,
@@ -165,6 +173,7 @@ class TradingBot:
 
     def _on_ws_connect(self):
         """Handle WebSocket connection."""
+        self._last_polymarket_reconnect_ms = time.monotonic() * 1000
         timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
         print(colored(f"[{timestamp}] WebSocket connected", "green"))
 
@@ -187,14 +196,38 @@ class TradingBot:
         signal_data = getattr(self.coinbase_feed, "_last_signal_data", None)
         spread_snapshot = self._get_spread_snapshot(token_id)
 
+        # Check reconnect cooldown (stale cache guard)
+        reconnect_ago_ms = None
+        if self._last_polymarket_reconnect_ms > 0:
+            reconnect_ago_ms = time.monotonic() * 1000 - self._last_polymarket_reconnect_ms
+            # Only include in logs if recent (< 30s)
+            if reconnect_ago_ms > 30000:
+                reconnect_ago_ms = None
+
         # Determine outcome
         outcome = "executed"
         if not self.signal_controller.is_enabled:
             outcome = "skipped_disabled"
             print(colored(f"[{timestamp}] Skipped: auto-signals disabled", "yellow"))
-        elif any(pos.token_id == token_id for pos in self.position_manager.list_open_positions()):
-            outcome = "skipped_position_open"
-            print(colored(f"[{timestamp}] Skipped: position already open", "yellow"))
+        elif reconnect_ago_ms is not None and reconnect_ago_ms < self.config.reconnect_cooldown_ms:
+            outcome = "skipped_reconnect_cooldown"
+            print(colored(f"[{timestamp}] Skipped: WS reconnect {reconnect_ago_ms:.0f}ms ago (cooldown {self.config.reconnect_cooldown_ms}ms)", "yellow"))
+        elif self.position_manager.has_active_position(token_id):
+            outcome = "skipped_position_active"
+            print(colored(f"[{timestamp}] Skipped: position already active", "yellow"))
+            # Log concurrent_position_warning if a CLOSING position blocked this signal
+            closing_pos = next(
+                (pos for pos in self.position_manager.positions.values()
+                 if pos.token_id == token_id and pos.status == PositionStatus.CLOSING),
+                None,
+            )
+            if closing_pos:
+                self.data_logger.log({
+                    "type": "concurrent_position_warning",
+                    "token_id": token_id,
+                    "closing_position_id": closing_pos.id,
+                    "signal_direction": direction,
+                })
         elif not self.signal_controller._check_spread(token_id):
             outcome = "skipped_spread_wide"
             print(colored(f"[{timestamp}] Skipped: spread too wide", "yellow"))
@@ -209,6 +242,7 @@ class TradingBot:
             "window_ticks": signal_data["window_ticks"] if signal_data else [],
             "signal_time_ms": signal_data["signal_time_ms"] if signal_data else None,
             "polymarket_spread": spread_snapshot,
+            "ws_reconnected_ago_ms": round(reconnect_ago_ms) if reconnect_ago_ms is not None else None,
         })
 
         if outcome != "executed":

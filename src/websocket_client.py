@@ -23,6 +23,7 @@ class PriceStream:
         on_connect: Optional[Callable[[], None]] = None,
         on_disconnect: Optional[Callable[[], None]] = None,
         price_cache: Optional["PriceCache"] = None,
+        data_logger: Optional[object] = None,
     ):
         """
         Initialize price stream.
@@ -33,12 +34,14 @@ class PriceStream:
             on_connect: Optional callback when connected
             on_disconnect: Optional callback when disconnected
             price_cache: Optional shared PriceCache to update on every price message
+            data_logger: Optional DataLogger for ws_event logging
         """
         self.token_ids = token_ids
         self.on_price_update = on_price_update
         self.on_connect = on_connect
         self.on_disconnect = on_disconnect
         self.price_cache = price_cache
+        self.data_logger = data_logger
 
         # Current prices cache (internal, for backward compatibility)
         self.prices: dict[str, dict] = {}
@@ -60,6 +63,8 @@ class PriceStream:
 
                     if self.on_connect:
                         self.on_connect()
+                    if self.data_logger:
+                        self.data_logger.log({"type": "ws_event", "feed": "polymarket", "event": "reconnect"})
 
                     # Subscribe to each token's market data
                     for token_id in self.token_ids:
@@ -78,6 +83,8 @@ class PriceStream:
             except ConnectionClosed:
                 if self.on_disconnect:
                     self.on_disconnect()
+                if self.data_logger:
+                    self.data_logger.log({"type": "ws_event", "feed": "polymarket", "event": "disconnect"})
                 if self._running:
                     # Reconnect after brief delay
                     await asyncio.sleep(1)

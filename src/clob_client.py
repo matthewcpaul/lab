@@ -123,7 +123,7 @@ class FastClobClient:
         d_price = Decimal(str(price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
         # Try the given price first, then adjust price down by 1 cent at a time
-        max_price_adjustments = 3  # At most 3 cents worse
+        max_price_adjustments = 5  # At most 5 cents worse
         for _ in range(max_price_adjustments + 1):
             if d_price <= 0:
                 break
@@ -161,20 +161,34 @@ class FastClobClient:
         if not best_ask:
             return {"success": False, "errorMsg": "No asks available"}
 
-        # Apply slippage tolerance for FAK fill reliability
-        if slippage_cents > 0:
-            best_ask = min(best_ask + slippage_cents / 100, 0.99)
-
-        # Use Decimal for precise calculation
-        d_price = Decimal(str(best_ask)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        d_original_price = Decimal(str(best_ask)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
         d_amount = Decimal(str(dollar_amount))
 
-        # Calculate raw size, round down to whole number to eliminate exit dust
-        raw_size = d_amount / d_price
-        rounded_size = float(raw_size.to_integral_value(rounding=ROUND_DOWN))
-        if rounded_size < 1:
-            rounded_size = 1.0  # Minimum 1 share
-        size, price = self._clean_order_amounts(rounded_size, float(d_price))
+        # 1. Whole shares at original ask (before slippage)
+        whole_size = int((d_amount / d_original_price).to_integral_value(rounding=ROUND_DOWN))
+        if whole_size < 1:
+            whole_size = 1
+
+        # 2. Slippage only affects limit price, not share count
+        limit_price = best_ask
+        if slippage_cents > 0:
+            limit_price = min(best_ask + slippage_cents / 100, 0.99)
+        d_limit = Decimal(str(limit_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+        # 3. Cap USDC commitment to whole_size * original_ask.
+        #    This bounds the fill: at the original ask, we receive at most
+        #    whole_size shares. Price improvement may still produce a small
+        #    fractional part, but never more than whole_size total.
+        target_usdc = Decimal(str(whole_size)) * d_original_price
+        capped_size = float((target_usdc / d_limit).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+
+        # Try the slippage limit price first. If _clean_order_amounts can't
+        # find a valid pair (or drops the price below the original ask, which
+        # would make the FAK pointless), fall back to exact whole shares at
+        # the original ask -- that product (int × 2dp) always has ≤2 decimals.
+        size, price = self._clean_order_amounts(capped_size, float(d_limit))
+        if size <= 0 or price < float(d_original_price):
+            size, price = float(whole_size), float(d_original_price)
 
         if size <= 0:
             return {"success": False, "errorMsg": "Calculated size is zero"}
@@ -428,12 +442,15 @@ class FastClobClient:
                 except (ValueError, TypeError, ZeroDivisionError):
                     pass
 
-            # If no fill data from takingAmount/makingAmount, query for fill data
+            # If no fill data from takingAmount/makingAmount, poll for fill data.
+            # The exchange has already matched this order, so fill data should
+            # be available quickly. Use fast polling to minimize exit latency.
+            # (Reduced from 3 attempts with 0.5/1.0/1.5s sleeps = 3.0s total
+            #  to 2 attempts with 0/0.25s sleeps = 0.25s total.)
             if filled == 0 and success and order_id:
-                # Retry loop: trade data may take a moment to appear
-                for attempt in range(3):
-                    # Wait for order to be processed (increasing delay)
-                    time.sleep(0.5 + attempt * 0.5)
+                for attempt in range(2):
+                    if attempt > 0:
+                        time.sleep(0.25)
 
                     # Try to get fill details from order status
                     order_details = self.get_order_details(order_id)
@@ -453,19 +470,17 @@ class FastClobClient:
                             # Only trust "price" field if we also got fill data
                             fill_price = float(order_details["price"])
 
-                    # If still no fill data, check recent trades
-                    if filled == 0 and token_id:
+                    if filled > 0:
+                        break
+
+                    # Check recent trades as fallback on last attempt (extra REST call)
+                    if attempt == 1 and filled == 0 and token_id:
                         trade_fill = self._get_fill_from_trades(order_id, token_id, side)
                         if trade_fill:
                             filled = trade_fill["filled"]
                             fill_price = trade_fill["price"]
 
-                    # If we got fill data, stop retrying
-                    if filled > 0:
-                        break
-
-                # Last resort: if order was successful but no fill data found,
-                # assume full fill at submitted price
+                # If no fill data found, assume full fill at submitted price
                 if filled == 0 and success:
                     filled = requested_size
 

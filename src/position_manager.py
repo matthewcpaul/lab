@@ -84,7 +84,6 @@ class PositionManager:
         self.price_cache = price_cache
 
         self.positions: dict[str, Position] = {}
-        self._exit_lock = asyncio.Lock()
 
     def add_position(
         self,
@@ -93,6 +92,7 @@ class PositionManager:
         entry_price: float,
         shares: float,
         entry_bid: float = None,
+        position_id: str = None,
     ) -> Position:
         """
         Create and track a new position.
@@ -103,8 +103,10 @@ class PositionManager:
             entry_price: Price we paid (ASK)
             shares: Number of shares
             entry_bid: Current BID at entry time; used for SL only. TP is from entry_price.
+            position_id: Optional pre-generated position ID for log correlation
         """
-        position_id = str(uuid.uuid4())[:8]
+        if position_id is None:
+            position_id = str(uuid.uuid4())[:8]
 
         # TP from entry_price (ask): target is above what we paid
         tp_price = round(entry_price * (1 + self.config.take_profit_pct), 2)
@@ -140,6 +142,13 @@ class PositionManager:
     def list_open_positions(self) -> list[Position]:
         """Return list of open positions."""
         return [p for p in self.positions.values() if p.status == PositionStatus.OPEN]
+
+    def has_active_position(self, token_id: str) -> bool:
+        """Check if any OPEN or CLOSING position exists for this token."""
+        return any(
+            pos.token_id == token_id and pos.status in (PositionStatus.OPEN, PositionStatus.CLOSING)
+            for pos in self.positions.values()
+        )
 
     def check_exit_conditions(self, token_id: str, current_bid: float):
         """
@@ -182,6 +191,13 @@ class PositionManager:
             if not pos.is_stale and position_age_sec >= self.config.stale_position_sec:
                 pos.is_stale = True
                 pos.stale_since_ms = now_ms
+                if self.data_logger:
+                    self.data_logger.log({
+                        "type": "stale_position",
+                        "position_id": pos.id,
+                        "age_sec": round(position_age_sec, 1),
+                        "current_bid": current_bid,
+                    })
 
             # Stale breakeven exit: if stale AND can exit at breakeven or better
             # If underwater, wait for price to recover or hit stop loss
@@ -199,12 +215,11 @@ class PositionManager:
         trigger_price: float,
     ):
         """Async wrapper for trigger_exit to run in task."""
-        async with self._exit_lock:
-            if position.status != PositionStatus.OPEN:
-                return  # Already being closed
-            position.status = PositionStatus.CLOSING  # prevent re-entry
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self.trigger_exit, position, reason, trigger_price)
+        if position.status != PositionStatus.OPEN:
+            return  # Already being closed (no race: no await between check and set)
+        position.status = PositionStatus.CLOSING  # prevent re-entry
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.trigger_exit, position, reason, trigger_price)
 
     # Dust threshold: remaining shares worth less than this are not worth
     # aggressively retrying via FAK. A GTC limit sell is placed instead.
@@ -246,6 +261,7 @@ class PositionManager:
         remaining, total_filled, fill_prices = self._exit_sell_loop(
             position.token_id, remaining, total_filled, fill_prices,
             direction=position.direction,
+            initial_price=trigger_bid,  # skip cache on first attempt
             max_attempts=20, max_consecutive_failures=5, delay_on_fail=0.3,
         )
 
@@ -270,7 +286,7 @@ class PositionManager:
         # --- Finalize position ---
         if total_filled > 0:
             # Calculate weighted average exit price
-            total_value = sum(qty * price for qty, price in fill_prices)
+            total_value = sum(qty * price for qty, price, *_ in fill_prices)
             position.exit_price = total_value / total_filled
             # Update shares to reflect what was actually sold
             position.shares = total_filled
@@ -334,7 +350,7 @@ class PositionManager:
         self,
         position: Position,
         reason: ExitReason,
-        fill_prices: list[tuple[float, float]],
+        fill_prices: list[tuple],
         spread_at_trigger: Optional[dict],
         spread_at_fill: Optional[dict],
         trigger_bid: Optional[float] = None,
@@ -347,7 +363,11 @@ class PositionManager:
         if position.exit_price and position.entry_price > 0:
             pnl_dollars = (position.exit_price - position.entry_price) * position.shares
             pnl_pct = ((position.exit_price - position.entry_price) / position.entry_price) * 100
-        fill_details = [{"qty": q, "price": p} for q, p in fill_prices]
+        fill_details = [
+            {"qty": q, "price": p, "ts": ts, "order_id": oid}
+            for q, p, ts, oid in fill_prices
+        ]
+        order_ids = [oid for _, _, _, oid in fill_prices if oid]
         event = {
             "type": "exit",
             "position_id": position.id,
@@ -360,6 +380,7 @@ class PositionManager:
             "pnl_dollars": pnl_dollars,
             "pnl_pct": pnl_pct,
             "fill_details": fill_details,
+            "order_ids": order_ids,
             "polymarket_spread_at_trigger": spread_at_trigger,
             "polymarket_spread_at_fill": spread_at_fill,
         }
@@ -368,7 +389,12 @@ class PositionManager:
         self.data_logger.log(event)
 
     def _place_dust_gtc(self, position: Position, remaining: float, best_bid: float):
-        """Place a GTC limit sell for dust shares that couldn't be sold via FAK."""
+        """Place a GTC limit sell for dust shares that couldn't be sold via FAK.
+
+        If the first attempt fails with "Calculated size is zero" (no valid
+        size*price pair at that price), retry once at best_bid - $0.01.
+        A penny worse, but more likely to find a valid size/price combination.
+        """
         timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
         dust_value = remaining * best_bid
 
@@ -377,6 +403,22 @@ class PositionManager:
             remaining,
             best_bid,
         )
+
+        # Retry once at a lower price if size came out to zero
+        if (
+            not result.get("success")
+            and "size is zero" in (result.get("errorMsg") or "").lower()
+            and best_bid - 0.01 >= 0.01
+        ):
+            retry_price = round(best_bid - 0.01, 2)
+            result = self.clob_client.place_limit_sell(
+                position.token_id,
+                remaining,
+                retry_price,
+            )
+            if result.get("success"):
+                best_bid = retry_price  # update for log message
+                dust_value = remaining * best_bid
 
         if result.get("success"):
             sell_price = result.get("price", best_bid)
@@ -397,12 +439,13 @@ class PositionManager:
         token_id: str,
         remaining: float,
         total_filled: float,
-        fill_prices: list[tuple[float, float]],
+        fill_prices: list[tuple],
         direction: str = "",
+        initial_price: Optional[float] = None,
         max_attempts: int = 20,
         max_consecutive_failures: int = 5,
         delay_on_fail: float = 0.3,
-    ) -> tuple[float, float, list[tuple[float, float]]]:
+    ) -> tuple[float, float, list[tuple]]:
         """
         Attempt to sell remaining shares in a retry loop.
         Logs each fill and retry inline.
@@ -413,6 +456,7 @@ class PositionManager:
             total_filled: Running total of filled shares (accumulated across phases)
             fill_prices: Running list of (qty, price) tuples
             direction: "UP" or "DOWN" for log messages
+            initial_price: If provided, use as best_bid on the first attempt (skip cache read)
             max_attempts: Max sell attempts
             max_consecutive_failures: Give up after this many consecutive failures
             delay_on_fail: Seconds to sleep between failed attempts
@@ -426,8 +470,12 @@ class PositionManager:
         while remaining > 0.01 and attempt < max_attempts and consecutive_failures < max_consecutive_failures:
             attempt += 1
 
-            # Get best bid: use cache for speed, fall back to REST if stale
-            best_bid = self._get_cached_best_bid(token_id)
+            # First attempt: use trigger price directly to skip cache latency
+            if attempt == 1 and initial_price is not None:
+                best_bid = initial_price
+            else:
+                # Get best bid: use cache for speed, fall back to REST if stale
+                best_bid = self._get_cached_best_bid(token_id)
 
             if best_bid is None or best_bid <= 0:
                 consecutive_failures += 1
@@ -447,7 +495,9 @@ class PositionManager:
 
                 if filled > 0:
                     total_filled += filled
-                    fill_prices.append((filled, fill_price))
+                    fill_ts = datetime.now(timezone.utc).isoformat()
+                    sell_order_id = result.get("orderID")
+                    fill_prices.append((filled, fill_price, fill_ts, sell_order_id))
                     remaining -= filled
                     consecutive_failures = 0  # Reset on any fill
 

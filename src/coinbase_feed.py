@@ -80,6 +80,7 @@ class CoinbaseFeed:
         on_signal: SignalCallback,
         on_connect: Optional[Callable[[], None]] = None,
         on_disconnect: Optional[Callable[[], None]] = None,
+        data_logger: Optional[object] = None,
     ):
         """
         Initialize Coinbase feed.
@@ -92,6 +93,7 @@ class CoinbaseFeed:
                        Can be sync or async function.
             on_connect: Optional callback when connected
             on_disconnect: Optional callback when disconnected
+            data_logger: Optional DataLogger for ws_event logging
         """
         self.window = RollingWindow(window_ms)
         self.threshold = threshold
@@ -99,23 +101,18 @@ class CoinbaseFeed:
         self.on_signal = on_signal
         self.on_connect = on_connect
         self.on_disconnect = on_disconnect
+        self.data_logger = data_logger
 
         self._last_signal_time: float = 0
         self._last_signal_data: Optional[dict] = None  # Snapshot when signal fires (for data logging)
         self._running = False
         self._paused = False
         self._ws = None
-
-        # Async queue for non-blocking signal processing
-        self._signal_queue: asyncio.Queue[str] = asyncio.Queue()
-        self._signal_processor_task: Optional[asyncio.Task] = None
+        self._latest_price: float = 0.0  # Latest BTC price (thread-safe atomic float)
 
     async def connect(self):
         """Connect to Coinbase WebSocket and start processing matches."""
         self._running = True
-
-        # Start signal processor task (runs in background, consumes queue)
-        self._signal_processor_task = asyncio.create_task(self._process_signals())
 
         while self._running:
             try:
@@ -136,6 +133,8 @@ class CoinbaseFeed:
 
                     if self.on_connect:
                         self.on_connect()
+                    if self.data_logger:
+                        self.data_logger.log({"type": "ws_event", "feed": "coinbase", "event": "reconnect"})
 
                     # Process messages
                     async for message in ws:
@@ -146,6 +145,8 @@ class CoinbaseFeed:
             except ConnectionClosed:
                 if self.on_disconnect:
                     self.on_disconnect()
+                if self.data_logger:
+                    self.data_logger.log({"type": "ws_event", "feed": "coinbase", "event": "disconnect"})
                 if self._running:
                     # Clear window on disconnect
                     self.window.clear()
@@ -156,14 +157,6 @@ class CoinbaseFeed:
                     await asyncio.sleep(1)
 
         self._ws = None
-
-        # Cancel signal processor task
-        if self._signal_processor_task:
-            self._signal_processor_task.cancel()
-            try:
-                await self._signal_processor_task
-            except asyncio.CancelledError:
-                pass
 
     def stop(self):
         """Stop the feed."""
@@ -184,6 +177,11 @@ class CoinbaseFeed:
     @property
     def is_connected(self) -> bool:
         return self._ws is not None
+
+    @property
+    def latest_price(self) -> float:
+        """Latest BTC-USD price from Coinbase (thread-safe read)."""
+        return self._latest_price
 
     def _process_message(self, message: str):
         """Process incoming WebSocket message."""
@@ -209,6 +207,9 @@ class CoinbaseFeed:
             time_ms = self._parse_timestamp(time_str)
             if time_ms is None:
                 return
+
+            # Update latest price (atomic float assignment, thread-safe)
+            self._latest_price = price
 
             # Add to rolling window
             self.window.add(time_ms, price)
@@ -242,7 +243,7 @@ class CoinbaseFeed:
             return None
 
     def _check_signal(self, current_time_ms: float):
-        """Check if volatility threshold crossed and queue signal (non-blocking)."""
+        """Check if volatility threshold crossed and dispatch signal directly."""
         if self._paused:
             return
 
@@ -258,7 +259,7 @@ class CoinbaseFeed:
         if current_time_ms - self._last_signal_time < self.cooldown_ms:
             return
 
-        # Queue signal (non-blocking - doesn't wait for processing)
+        # Direct dispatch (no queue hop - saves one event-loop iteration of latency)
         direction = "UP" if pct_change > 0 else "DOWN"
         self._last_signal_time = current_time_ms
 
@@ -270,29 +271,14 @@ class CoinbaseFeed:
             "signal_time_ms": current_time_ms,
         }
 
-        # put_nowait is non-blocking - if queue is full, raises QueueFull
-        # We use an unbounded queue so this won't happen in practice
+        loop = asyncio.get_running_loop()
+        loop.create_task(self._fire_signal(direction))
+
+    async def _fire_signal(self, direction: str):
+        """Fire signal callback directly (no queue indirection)."""
         try:
-            self._signal_queue.put_nowait(direction)
-        except asyncio.QueueFull:
-            pass  # Drop signal if queue somehow fills up
-
-    async def _process_signals(self):
-        """Background task that consumes signal queue and calls callback."""
-        while self._running:
-            try:
-                # Wait for next signal (blocks until available)
-                direction = await self._signal_queue.get()
-
-                # Call the signal callback (supports both sync and async)
-                result = self.on_signal(direction)
-                if asyncio.iscoroutine(result):
-                    await result
-
-                self._signal_queue.task_done()
-
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                # Don't let callback errors kill the processor
-                pass
+            result = self.on_signal(direction)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            pass  # Don't let callback errors propagate
